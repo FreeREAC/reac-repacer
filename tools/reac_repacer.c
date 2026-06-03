@@ -53,7 +53,8 @@ static volatile unsigned r_head, r_tail;           /* SPSC: fwd_rx produces, mai
 
 static volatile sig_atomic_t running = 1;
 static unsigned long long n_rx, n_tx, n_drop_full, n_underrun, n_txerr, n_ret, n_reterr, n_ctrl, n_plc;
-static int g_bcast_only, g_bypass, g_ctrl_bypass;
+static unsigned long long g_in_frames;     /* every accepted input frame, for startup rate detection */
+static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
 static int g_servo_clamp_ppm = 3000;   /* servo period clamp (was a hardcoded ±500ppm,
                                         * too tight to reach the master's true rate) */
 static int g_adapt;                 /* adaptive variable-window: auto-size buffer to burst depth */
@@ -101,15 +102,16 @@ static void *fwd_rx(void *arg) {
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* skip our own return TX */
 		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;        /* REAC ethertype */
 		if (g_bcast_only && buf[0] != 0xff) continue;               /* master broadcast only */
-		/* ALL frame types ride ONE master counter sequence at a constant 4000/s
-		 * (verified on-rig: cdea channel-map + cfea announce occupy counter slots
-		 * INTERSPERSED with 0000 audio — audio+cdea always sum to ~4000/s, control
-		 * does not add to the stream, it replaces audio slots). Each cdea/cfea also
-		 * carries 12 audio samples in its slot. Emitting them early (--ctrl-bypass)
-		 * puts those samples ahead of cadence -> one click per control frame: the
-		 * 1 Hz "heartbeat" at lock, a click-storm at the 500/s acquisition rate.
-		 * Default keeps every type IN SEQUENCE through the ring; in == out == 4000/s
-		 * so latency stays flat even through an enumeration storm. */
+		g_in_frames++;                                              /* input frame rate (startup detect) */
+		/* ALL frame types ride ONE master counter sequence at a constant packet rate:
+		 * the control frames (cdea channel-map, cfea announce) occupy counter slots
+		 * interspersed with 0000 audio -- they replace audio slots rather than adding
+		 * to the stream, so audio+control always sum to the packet rate. Each control
+		 * frame also carries audio samples in its slot, so emitting it early
+		 * (--ctrl-bypass) puts those samples ahead of cadence: one click per control
+		 * frame -- the periodic heartbeat at lock, a denser burst during connection
+		 * setup. Default keeps every type IN SEQUENCE through the ring; in == out, so
+		 * latency stays flat even through a control burst. */
 		int is_ctrl = !(buf[16] == 0x00 && buf[17] == 0x00);
 		if (is_ctrl) {
 			n_ctrl++;
@@ -150,7 +152,7 @@ int main(int argc, char **argv) {
 		if (!strcmp(argv[i], "--in") && i + 1 < argc) in = argv[++i];
 		else if (!strcmp(argv[i], "--out") && i + 1 < argc) out = argv[++i];
 		else if (!strcmp(argv[i], "--prefill-ms") && i + 1 < argc) prefill_ms = atoi(argv[++i]);
-		else if (!strcmp(argv[i], "--period-ns") && i + 1 < argc) period_ns = atol(argv[++i]);
+		else if (!strcmp(argv[i], "--period-ns") && i + 1 < argc) { period_ns = atol(argv[++i]); g_auto_rate = 0; }
 		else if (!strcmp(argv[i], "--cpu") && i + 1 < argc) cpu = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--prio") && i + 1 < argc) prio = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--bcast-only")) g_bcast_only = 1;
@@ -162,6 +164,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--adapt-min-ms") && i + 1 < argc) g_adapt_min_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--adapt-max-ms") && i + 1 < argc) g_adapt_max_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
+		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
 	}
 	int prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 	if (prefill < 1) prefill = 1;
@@ -181,6 +184,36 @@ int main(int argc, char **argv) {
 	if (syscall(__NR_sched_setscheduler, 0, SCHED_FIFO, &sp) != 0) perror("sched_setscheduler");
 	int pm = open("/dev/cpu_dma_latency", O_WRONLY);
 	if (pm >= 0) { int z = 0; if (write(pm, &z, sizeof z) < 0) perror("cpu_dma_latency"); }
+
+	if (g_auto_rate) {
+		/* Detect the sample rate from the input packet rate: a REAC stream emits one
+		 * frame per slot, so the measured input pps gives the slot period directly. Count
+		 * over a couple of seconds (bursts average out), snap to the nearest standard rate
+		 * when close, else use the measured value verbatim. Set --period-ns to override. */
+		unsigned long long f0 = g_in_frames; long long t0 = ns_now();
+		struct timespec ms = { 2, 0 }; nanosleep(&ms, NULL);
+		double secs = (double)(ns_now() - t0) / 1.0e9;
+		double pps = secs > 0 ? (double)(g_in_frames - f0) / secs : 0;
+		if (pps > 100.0) {
+			static const long std_pps[] = { 3675, 4000, 8000 };   /* 44.1 / 48 / 96 kHz */
+			long snap = std_pps[0]; double best = 1e18;
+			for (unsigned i = 0; i < sizeof std_pps / sizeof std_pps[0]; i++) {
+				double d = pps - (double)std_pps[i]; if (d < 0) d = -d;
+				if (d < best) { best = d; snap = std_pps[i]; }
+			}
+			long chosen = (best < (double)snap * 0.08) ? snap : (long)(pps + 0.5);
+			period_ns = (long)(1.0e9 / (double)chosen + 0.5);
+			prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
+			if (prefill < 1) prefill = 1;
+			if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
+			fprintf(stderr, "auto-rate: %.0f pps measured -> %ld pps (%.1f kHz), period=%ld ns\n",
+			        pps, chosen, (double)chosen * 12.0 / 1000.0, period_ns);
+		} else {
+			fprintf(stderr, "auto-rate: no input seen; keeping period=%ld ns\n", period_ns);
+		}
+		/* the ring overfilled during the measurement window -> drop it and prefill fresh */
+		__atomic_store_n(&r_head, __atomic_load_n(&r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+	}
 
 	fprintf(stderr, "repacer(bidir): in=%s out=%s prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d ctrl_bypass=%d servo_clamp=%dppm adapt=%d(margin=%d %d-%dms) plc=%d\n",
 	        in, out, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_ctrl_bypass, g_servo_clamp_ppm, g_adapt, g_adapt_margin, g_adapt_min_ms, g_adapt_max_ms, g_plc);
