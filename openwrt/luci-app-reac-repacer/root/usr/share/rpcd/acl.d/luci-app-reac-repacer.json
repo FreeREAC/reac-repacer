@@ -1,0 +1,17 @@
+{
+	"luci-app-reac-repacer": {
+		"description": "Grant access to REAC Wi-Fi re-pacer config",
+		"read": {
+			"uci": [ "reac-repacer" ],
+			"ubus": {
+				"service": [ "list" ]
+			}
+		},
+		"write": {
+			"uci": [ "reac-repacer" ],
+			"ubus": {
+				"service": [ "event" ]
+			}
+		}
+	}
+}

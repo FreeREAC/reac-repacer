@@ -1,0 +1,13 @@
+{
+	"admin/services/reac-repacer": {
+		"title": "REAC Re-pacer",
+		"order": 61,
+		"action": {
+			"type": "view",
+			"path": "reac-repacer/config"
+		},
+		"depends": {
+			"acl": [ "luci-app-reac-repacer" ]
+		}
+	}
+}
