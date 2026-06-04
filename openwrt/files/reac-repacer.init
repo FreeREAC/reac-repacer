@@ -1,0 +1,77 @@
+#!/bin/sh /etc/rc.common
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
+
+# procd init for reac-repacer: ONE de-jitter relay daemon handling every REAC
+# port on a single shared clock. Global settings live in the 'repacer' section;
+# each 'port' section is one REAC zone. Runs after the network so the bridge and
+# ports exist; START is high so the real-time relay comes up last.
+USE_PROCD=1
+START=96
+STOP=10
+
+PROG=/usr/bin/reac-repacer
+
+# Built up by config_foreach over the 'port' sections.
+RP_PORTS=""
+RP_UNBRIDGE=1
+
+handle_port() {
+	local cfg="$1"
+	local enabled in_iface out_iface
+	config_get_bool enabled "$cfg" enabled 1
+	[ "$enabled" = "1" ] || return 0
+	config_get in_iface "$cfg" in_iface
+	config_get out_iface "$cfg" out_iface
+	[ -n "$in_iface" ] && [ -n "$out_iface" ] || {
+		logger -t reac-repacer "port $cfg: in_iface and out_iface are required"; return 0; }
+
+	# Raw AF_PACKET TX is dropped by the DSA switch on a VLAN-filtering bridge
+	# slave, so each relay port must be standalone; and the relay is the pacer,
+	# so clear any TBF qdisc left on the egress port.
+	if [ "$RP_UNBRIDGE" = "1" ]; then
+		ip link set dev "$in_iface" nomaster 2>/dev/null
+		ip link set dev "$out_iface" nomaster 2>/dev/null
+		tc qdisc del dev "$out_iface" root 2>/dev/null
+	fi
+	RP_PORTS="$RP_PORTS --port $in_iface:$out_iface"
+}
+
+start_service() {
+	config_load reac-repacer
+	local enabled prefill_ms adapt auto_rate rate cpu bcast_only servo_clamp_ppm
+	config_get_bool enabled main enabled 1
+	[ "$enabled" = "1" ] || return 0
+	config_get prefill_ms       main prefill_ms 16
+	config_get_bool adapt       main adapt 1
+	config_get_bool auto_rate   main auto_rate 1
+	config_get rate             main rate 48000
+	config_get cpu              main cpu 3
+	config_get_bool bcast_only  main bcast_only 1
+	config_get_bool RP_UNBRIDGE main unbridge 1
+	config_get servo_clamp_ppm  main servo_clamp_ppm 700
+
+	RP_PORTS=""
+	config_foreach handle_port port
+	[ -n "$RP_PORTS" ] || { logger -t reac-repacer "no enabled ports configured"; return 1; }
+
+	procd_open_instance reac-repacer
+	# word-splitting of $RP_PORTS is intentional (each --port IN:OUT is one arg)
+	procd_set_param command "$PROG" $RP_PORTS \
+		--prefill-ms "$prefill_ms" --cpu "$cpu" --servo-clamp-ppm "$servo_clamp_ppm"
+	[ "$bcast_only" = "1" ] && procd_append_param command --bcast-only
+	[ "$adapt" = "1" ] && procd_append_param command --adapt
+	if [ "$auto_rate" != "1" ]; then
+		# pin the slot period to the chosen rate: period_ns = 12e9 / rate
+		procd_append_param command --no-auto-rate --period-ns "$((12000000000 / rate))"
+	fi
+	# Runs as root (not a capabilities sandbox): the relay needs SCHED_FIFO,
+	# mlockall and /dev/cpu_dma_latency for jitter-free pacing, plus CAP_NET_RAW.
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger reac-repacer
+}
