@@ -146,6 +146,13 @@ static void *ret_relay(void *arg) {
 	return NULL;
 }
 
+static long nearest_std_pps(double pps) {
+	static const long t[] = { 3675, 4000, 8000 };   /* 44.1 / 48 / 96 kHz */
+	long best = t[0]; double bd = 1e18;
+	for (unsigned i = 0; i < 3; i++) { double d = pps - (double)t[i]; if (d < 0) d = -d; if (d < bd) { bd = d; best = t[i]; } }
+	return best;
+}
+
 int main(int argc, char **argv) {
 	const char *in = "reactap.11", *out = "lan1";
 	int prefill_ms = 12, cpu = 3, prio = 80; long period_ns = 250000;
@@ -245,6 +252,8 @@ int main(int argc, char **argv) {
 	/* PLC / output-counter state: the re-pacer owns a monotonic emit_ctr */
 	unsigned emit_ctr = 0; int last_idx = 0, have_last = 0;
 	uint8_t plc_buf[SLOT_SZ];
+	unsigned long long last_in = g_in_frames;   /* for continuous rate detection */
+	int rate_chg = 0;
 	while (running) {
 		struct timespec d = { deadline / 1000000000LL, deadline % 1000000000LL };
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
@@ -336,7 +345,34 @@ int main(int argc, char **argv) {
 		}
 		deadline += (long long)(period + 0.5);
 		long long now = ns_now();
-		if (now - last > 2000000000LL) {
+		if (now - last > 1000000000LL) {
+			/* continuous rate detection: a SAMPLE-RATE change shifts the input pps far from the
+			 * pacing rate (a clock offset is <0.3%, a 44.1<->48<->96 k change is 9-100%). Re-lock
+			 * at the new rate instead of draining the buffer -- the console can change rate live. */
+			double rsecs = (double)(now - last) / 1.0e9;
+			double in_pps = (double)(g_in_frames - last_in) / rsecs;
+			last_in = g_in_frames;
+			long cand = nearest_std_pps(in_pps);
+			double cerr = (in_pps >= (double)cand) ? (in_pps - cand) / cand : (cand - in_pps) / cand;
+			int is_change = (g_auto_rate && in_pps > 2000.0 && cerr < 0.03 && cand != nearest_std_pps(1.0e9 / period_ns));
+			if (is_change) rate_chg++; else rate_chg = 0;
+			if (rate_chg >= 3) {   /* a standard rate sustained ~8 s -> a real (rare) change, ~3s -> re-lock */
+				rate_chg = 0; period_ns = (long)(1.0e9 / (double)cand + 0.5); period = (double)period_ns;
+				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
+				if (prefill < 1) prefill = 1;
+				if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
+				edit_win = (int)(1.0e9 / (double)period_ns); if (edit_win < 1000) edit_win = 1000;
+				retune_win = (int)(8.0e9 / (double)period_ns); if (retune_win < 8000) retune_win = 8000;
+				t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
+				t_ceil = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
+				target = prefill; retune_avg0 = (double)prefill;
+				occ_sum = 0; occ_cnt = 0; edit_owe = 0; edit_gap = 0; retune_occ_sum = 0; retune_cnt = 0;
+				occ_min_win = 1 << 30; adapt_cnt = 0; gh = 0; sd = 0;
+				__atomic_store_n(&r_head, __atomic_load_n(&r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+				while (running) { int o = (int)((__atomic_load_n(&r_tail, __ATOMIC_ACQUIRE) - r_head) & RING_MASK); if (o >= prefill) break; struct timespec rt = { 0, 1000000 }; nanosleep(&rt, NULL); }
+				fprintf(stderr, "auto-rate: input rate changed to %.0f pps (%.1f kHz) -> re-locked, period=%ld ns\n", in_pps, in_pps * 12.0 / 1000.0, period_ns);
+				last_in = g_in_frames; deadline = ns_now() + period_ns; last = ns_now(); continue;
+			}
 			fprintf(stderr, "  rx=%llu tx=%llu occ=%d(%dms) tgt=%d per=%.0f skip=%llu hold=%llu under=%llu plc=%llu | ctrl=%llu ret=%llu\n",
 			        n_rx, n_tx, occ, (int)((long long)occ * period_ns / 1000000), target, period, n_skip, n_hold, n_underrun, n_plc, n_ctrl, n_ret);
 			last = now;
