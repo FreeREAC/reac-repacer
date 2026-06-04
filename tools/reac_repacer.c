@@ -64,7 +64,7 @@
 #define MAX_STREAMS 8
 
 /* drain servo (latency control by clock rate, not by dropping frames) */
-#define SERVO_SETPOINT 2.0   /* hold the tightest active port this many slots above its target */
+#define SERVO_SETPOINT 4.0   /* hold the tightest active port this many slots above its target */
 #define SERVO_KP       8.0   /* proportional gain (ppm per slot) -- damps the loop */
 #define SERVO_KI       0.02  /* integral gain -- nulls the residual rate offset (rate-match) */
 
@@ -76,7 +76,7 @@ static int g_servo_clamp_ppm = 700;    /* drain-servo clock-bias clamp (ppm). ~1
                                         * inaudible as a steady offset; bounds how fast latency is
                                         * reclaimed (latency falls ~ppm microseconds per second). */
 static int g_adapt;                 /* adaptive variable-window: auto-size buffer to burst depth */
-static int g_adapt_margin = 16;     /* keep the occ low-water-mark this many slots above 0 (safety) */
+static int g_adapt_margin = 20;     /* keep the occ low-water-mark this many slots above 0 (safety) */
 static int g_adapt_min_ms  = 6;     /* floor latency when shrinking */
 static int g_adapt_max_ms  = 120;   /* ceiling latency when growing */
 static int g_plc = 1;               /* gap concealment: repeat last frame (next counter) on underrun */
@@ -459,7 +459,10 @@ int main(int argc, char **argv) {
 			}
 			double need = maxD + (double)g_adapt_margin;
 			if (need > shtgt) shtgt = need;                /* cover a bigger burst immediately */
-			else shtgt += (need - shtgt) * 0.08;           /* sustained calm -> ease down ~8 %/s */
+			else shtgt += (need - shtgt) * 0.02;           /* slow-decaying peak-hold: ease down ~2 %/s,
+			                                                * so the target stays above the worst burst
+			                                                * seen in the last ~30 s (a 1 s window alone
+			                                                * misses bursts that fall in calmer seconds) */
 			if (shtgt < (double)t_floor) shtgt = (double)t_floor;
 			if (shtgt > (double)t_ceil)  shtgt = (double)t_ceil;
 			for (int i = 0; i < n_streams; i++) { streams[i].occ_min_win = 1 << 30; streams[i].target = (int)shtgt; }
