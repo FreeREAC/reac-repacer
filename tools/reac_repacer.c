@@ -63,13 +63,20 @@
 #define SLOT_SZ   1600
 #define MAX_STREAMS 8
 
+/* drain servo (latency control by clock rate, not by dropping frames) */
+#define SERVO_SETPOINT 2.0   /* hold the tightest active port this many slots above its target */
+#define SERVO_KP       8.0   /* proportional gain (ppm per slot) -- damps the loop */
+#define SERVO_KI       0.02  /* integral gain -- nulls the residual rate offset (rate-match) */
+
 static volatile sig_atomic_t running = 1;
 
 /* global config (identical for every port) */
 static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
-static int g_servo_clamp_ppm = 3000;   /* reserved: period clamp width in ppm */
+static int g_servo_clamp_ppm = 700;    /* drain-servo clock-bias clamp (ppm). ~1.2 cents at 700 --
+                                        * inaudible as a steady offset; bounds how fast latency is
+                                        * reclaimed (latency falls ~ppm microseconds per second). */
 static int g_adapt;                 /* adaptive variable-window: auto-size buffer to burst depth */
-static int g_adapt_margin = 10;     /* keep the occ low-water-mark this many slots above 0 */
+static int g_adapt_margin = 16;     /* keep the occ low-water-mark this many slots above 0 (safety) */
 static int g_adapt_min_ms  = 6;     /* floor latency when shrinking */
 static int g_adapt_max_ms  = 120;   /* ceiling latency when growing */
 static int g_plc = 1;               /* gap concealment: repeat last frame (next counter) on underrun */
@@ -100,6 +107,7 @@ struct stream {
 	int edit_win, edit_owe, edit_gap;
 	int t_floor, t_ceil, occ_min_win, adapt_cnt, gh, sd;
 	int started, prefill;           /* per-port activation: detect input, then prefill, then emit */
+	double occ_ema;                 /* smoothed occupancy -- the drain servo's input */
 	unsigned emit_ctr; int last_idx, have_last;
 	uint8_t plc_buf[SLOT_SZ];
 
@@ -200,6 +208,7 @@ static void stream_resize(struct stream *s, long period_ns, int prefill) {
 	s->t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (s->t_ceil > RING_SZ - 64) s->t_ceil = RING_SZ - 64;
 	s->target = prefill;
 	s->prefill = prefill;
+	s->occ_ema = (double)prefill;
 	s->started = 0;          /* re-arm per-port activation (prefill before emitting) */
 }
 
@@ -221,29 +230,25 @@ static int pace_one(struct stream *s, int *active) {
 		if (occ < s->prefill) { *active = 0; return occ; }
 		s->started = 1;
 		s->target = s->prefill;
-		s->occ_sum = 0; s->occ_cnt = 0; s->edit_owe = 0; s->edit_gap = 0;
+		s->occ_ema = (double)s->prefill;
 		s->occ_min_win = 1 << 30; s->adapt_cnt = 0; s->gh = 0; s->sd = 0;
 		fprintf(stderr, "port %s->%s: REAC detected, prefilled -> active\n", s->in_name, s->out_name);
 	}
-	int do_drop = 0, do_insert = 0;
-	if (s->edit_owe != 0 && ++s->edit_gap >= 250) {
-		if (s->edit_owe > 0) { if (occ > s->target / 2 + 2) { do_drop = 1; s->edit_owe--; s->edit_gap = 0; } }
-		else { do_insert = 1; s->edit_owe++; s->edit_gap = 0; }
-	}
-	if (do_insert || occ <= 0) {
-		/* hold: repeat the last frame's audio under the next counter, consuming nothing -- used
-		 * both to raise latency (insert) and to conceal a real underrun. The monotonic emit_ctr
-		 * is essential: a verbatim repeat (dup counter) reads as 65535 lost frames at the slave. */
-		if (occ <= 0 && !do_insert) s->n_underrun++;
+	/* Latency is controlled ONLY by the shared clock rate (the drain servo in the pacing
+	 * loop), never by dropping or holding frames -- so a clean signal is never clicked.
+	 * Here we just emit the next frame in sequence, or conceal a genuine underrun by
+	 * repeating the last frame under the next counter (a verbatim repeat would reuse a
+	 * counter and read as 65535 lost frames at the slave). */
+	if (occ <= 0) {
+		s->n_underrun++;
 		if (s->have_last) {
 			memcpy(s->plc_buf, s->slot_buf[s->last_idx], s->slot_len[s->last_idx]);
 			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
 			if (sendto(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], 0, (struct sockaddr *)&s->OUT.tx, sizeof s->OUT.tx) < 0) s->n_txerr++;
-			else { if (do_insert) s->n_hold++; else s->n_plc++; }
+			else s->n_plc++;
 			s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
 		}
 	} else {
-		if (do_drop) { head = (head + 1) & RING_MASK; occ--; s->n_skip++; }   /* discard one frame's audio */
 		uint8_t *f = s->slot_buf[head];
 		if (!s->have_last) s->emit_ctr = f[14] | (f[15] << 8);                /* seed the counter */
 		f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;        /* own a monotonic output counter */
@@ -252,38 +257,13 @@ static int pace_one(struct stream *s, int *active) {
 		__atomic_store_n(&s->r_head, (head + 1) & RING_MASK, __ATOMIC_RELEASE); s->n_tx++;
 		s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
 	}
-	/* edit budget from this port's ~1 s average occupancy: a wide deadband so burst
-	 * swings (absorbed by the buffer) never trigger an edit, and it idles once occ
-	 * sits near target. */
-	s->occ_sum += occ; s->occ_cnt++;
-	if (s->occ_cnt >= s->edit_win) {
-		double err = (double)s->occ_sum / s->occ_cnt - (double)s->target;
-		if (err > 32.0 || err < -32.0) {
-			s->edit_owe = (int)err;
-			if (s->edit_owe >  48) s->edit_owe =  48;
-			if (s->edit_owe < -48) s->edit_owe = -48;
-		} else s->edit_owe = 0;
-		s->occ_sum = 0; s->occ_cnt = 0;
-	}
-	/* variable window: size this port's buffer to its OBSERVED burst depth. Grow fast
-	 * on a low-water dip (RF-safe), then settle; only shrink with --reclaim (drops). */
-	if (g_adapt) {
-		if (occ < s->occ_min_win) s->occ_min_win = occ;
-		if (++s->adapt_cnt >= 4000) {              /* ~1 s */
-			int m = g_adapt_margin;
-			if (s->gh > 0) s->gh--;
-			if (s->sd > 0) s->sd--;
-			if (s->occ_min_win < m && s->gh == 0) { s->target += 16; s->gh = 2; s->sd = 60; }
-			else if (g_reclaim && s->occ_min_win > m + 6 && s->sd == 0) {
-				int sh = 1 + (s->occ_min_win - m) / 4; if (sh > 16) sh = 16;
-				s->target -= sh;
-			}
-			if (s->target < s->t_floor) s->target = s->t_floor;
-			if (s->target > s->t_ceil)  s->target = s->t_ceil;
-			s->occ_min_win = 1 << 30; s->adapt_cnt = 0;
-		}
-	}
-	*active = s->have_last;
+	/* smoothed occupancy (~0.5 s) + per-port low-water mark. These feed the ONE shared
+	 * target + drain servo in the pacing loop: all ports share a clock and a source, so a
+	 * single target sized to the worst dip across ports keeps them converged (per-port
+	 * targets would diverge once an underrun offsets one port's occupancy from the rest). */
+	s->occ_ema += ((double)occ - s->occ_ema) * (1.0 / 2048.0);
+	if (g_adapt && occ < s->occ_min_win) s->occ_min_win = occ;
+	*active = s->started;
 	return occ;
 }
 
@@ -431,41 +411,70 @@ int main(int argc, char **argv) {
 
 	long long deadline = ns_now() + period_ns; double period = (double)period_ns;
 	long long last = ns_now();
-	/* shared slow period re-tune: nudge the one frozen period to null the active ports'
-	 * mean occupancy drift. Driven by the active ports only, so a stalled port can't pull
-	 * the shared clock. ~8 s-spaced, tiny, bounded nudges -> nails the true source rate
-	 * with steady-state edits ~0 and no wander. */
-	int retune_win = (int)(8.0e9 / (double)period_ns);
-	if (retune_win < 8000) retune_win = 8000;
-	int retune_cnt = 0; double retune_occ_sum = 0; double retune_avg0 = (double)prefill;
+	/* drain servo: bias the one shared clock a few hundred ppm to steer the TIGHTEST active
+	 * port's smoothed occupancy onto its (adaptive) target -- fast to drain excess latency,
+	 * slow to fill, gated on the tightest port so none underruns. A steady, slowly-ramped
+	 * sub-cent offset is inaudible (unlike the old fast-wandering servo), and no frame is
+	 * ever dropped, so reclaiming latency from a clean signal stays click-free. PI with
+	 * anti-windup; clamp = --servo-clamp-ppm. */
+	double bias_ppm = 0.0, servo_integ = 0.0;
+	double max_ppm = (double)g_servo_clamp_ppm;
+	int servo_div = 0;
+	/* ONE shared target for all ports (they share a clock + a source). Sized to the worst
+	 * low-water dip across ports + margin: grow at once to cover a burst, ease down ~1 slot/4s
+	 * when calm. The servo then steers the tightest port's smoothed occupancy onto it. */
+	double shtgt = (double)prefill;
+	int adapt_div = 0;
+	int t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
+	int t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
 	int rate_chg = 0;
 
 	while (running) {
 		struct timespec d = { deadline / 1000000000LL, deadline % 1000000000LL };
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
 
-		/* emit every port on this shared tick; collect the active ports' mean occupancy */
-		double occ_acc = 0; int nact = 0; int show_occ = 0;
+		/* emit every port on this shared tick */
 		for (int i = 0; i < n_streams; i++) {
 			int active = 0;
-			int occ = pace_one(&streams[i], &active);
-			if (i == 0) show_occ = occ;
-			if (active) { occ_acc += occ; nact++; }
+			pace_one(&streams[i], &active);
 		}
-		double avg_occ = nact ? occ_acc / nact : (double)retune_avg0;
-
-		retune_occ_sum += avg_occ;
-		if (++retune_cnt >= retune_win) {
-			double avg = retune_occ_sum / retune_cnt;
-			double dd = avg - retune_avg0;
-			retune_avg0 = avg;
-			if (dd > 1.0 || dd < -1.0) {
-				double n = period * dd / (double)retune_win; if (n > 8.0) n = 8.0; if (n < -8.0) n = -8.0;
-				period -= n;
-				if (period < (double)period_ns * 0.997) period = (double)period_ns * 0.997;
-				if (period > (double)period_ns * 1.003) period = (double)period_ns * 1.003;
+		/* tightest smoothed occupancy across active ports -> the servo input */
+		double min_ema = 1e9; int have = 0;
+		for (int i = 0; i < n_streams; i++) {
+			if (!streams[i].started || streams[i].n_rx == 0) continue;
+			have = 1;
+			if (streams[i].occ_ema < min_ema) min_ema = streams[i].occ_ema;
+		}
+		/* shared-target adaptation (~every 1 s). Size to the worst BURST DEPTH across ports:
+		 * D_i = occ_ema_i - occ_min_i is how far port i dipped below its own smoothed level
+		 * this second -- offset-independent (a port sitting higher from a past underrun does
+		 * not inflate it). need = max(D) + margin. Grow at once to cover a bigger burst;
+		 * ease toward the requirement exponentially when calmer (reclaim latency, no drops). */
+		if (have && ++adapt_div >= 4000) {
+			double maxD = 0;
+			for (int i = 0; i < n_streams; i++) {
+				if (!streams[i].started || streams[i].n_rx == 0) continue;
+				double D = streams[i].occ_ema - (double)streams[i].occ_min_win;
+				if (D > maxD) maxD = D;
 			}
-			retune_occ_sum = 0; retune_cnt = 0;
+			double need = maxD + (double)g_adapt_margin;
+			if (need > shtgt) shtgt = need;                /* cover a bigger burst immediately */
+			else shtgt += (need - shtgt) * 0.08;           /* sustained calm -> ease down ~8 %/s */
+			if (shtgt < (double)t_floor) shtgt = (double)t_floor;
+			if (shtgt > (double)t_ceil)  shtgt = (double)t_ceil;
+			for (int i = 0; i < n_streams; i++) { streams[i].occ_min_win = 1 << 30; streams[i].target = (int)shtgt; }
+			adapt_div = 0;
+		}
+		/* drain servo (~every 16 ms): steer the tightest port's occupancy onto the shared target */
+		if (have && ++servo_div >= 64) {
+			double dpos = (min_ema - shtgt) - SERVO_SETPOINT;   /* >0: even the tightest port has slack -> drain */
+			servo_integ += dpos;
+			double raw = SERVO_KP * dpos + SERVO_KI * servo_integ;
+			if (raw >  max_ppm) { raw =  max_ppm; servo_integ -= dpos; }   /* anti-windup */
+			else if (raw < -max_ppm) { raw = -max_ppm; servo_integ -= dpos; }
+			bias_ppm = raw;
+			period = (double)period_ns * (1.0 - bias_ppm * 1e-6);          /* +bias = clock fast = drain */
+			servo_div = 0;
 		}
 
 		deadline += (long long)(period + 0.5);
@@ -488,8 +497,10 @@ int main(int argc, char **argv) {
 				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 				if (prefill < 1) prefill = 1;
 				if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
-				retune_win = (int)(8.0e9 / (double)period_ns); if (retune_win < 8000) retune_win = 8000;
-				retune_cnt = 0; retune_occ_sum = 0; retune_avg0 = (double)prefill;
+				bias_ppm = 0; servo_integ = 0; servo_div = 0;
+				shtgt = (double)prefill; adapt_div = 0;
+				t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
+				t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
 				for (int i = 0; i < n_streams; i++) {
 					streams[i].have_last = 0;
 					stream_relock(&streams[i], period_ns, prefill);
@@ -505,17 +516,16 @@ int main(int argc, char **argv) {
 				deadline = ns_now() + period_ns; last = ns_now(); continue;
 			}
 			/* per-port telemetry line */
-			fprintf(stderr, "per=%.0f", period);
+			fprintf(stderr, "per=%.0f bias=%+.0fppm", period, bias_ppm);
 			for (int i = 0; i < n_streams; i++) {
 				struct stream *s = &streams[i];
 				unsigned head = s->r_head, tail = __atomic_load_n(&s->r_tail, __ATOMIC_ACQUIRE);
 				int occ = (int)((tail - head) & RING_MASK);
-				fprintf(stderr, " | %s occ=%d(%dms) tgt=%d skip=%llu hold=%llu under=%llu plc=%llu rx=%llu",
+				fprintf(stderr, " | %s occ=%d(%dms) tgt=%d under=%llu plc=%llu rx=%llu",
 				        s->out_name, occ, (int)((long long)occ * period_ns / 1000000), s->target,
-				        s->n_skip, s->n_hold, s->n_underrun, s->n_plc, s->n_rx);
+				        s->n_underrun, s->n_plc, s->n_rx);
 			}
 			fprintf(stderr, "\n");
-			(void)show_occ;
 			last = now;
 		}
 	}
