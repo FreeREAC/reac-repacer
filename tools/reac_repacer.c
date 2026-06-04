@@ -6,7 +6,7 @@
 // Sits between the gretap tunnel (Wi-Fi, bursty) and the local REAC stagebox,
 // with BOTH interfaces unbridged so raw L2 TX works cleanly:
 //   forward (tunnel -> stagebox): buffers the bursty master broadcast a few ms
-//      and re-emits a constant ~250us cadence (clock-recovery servo) — fills the
+//      and re-emits a constant cadence on a frozen, drift-nailed clock — fills the
 //      gaps a clock-slave stagebox cannot tolerate.
 //   return  (stagebox -> tunnel): passes the stagebox's frames straight through
 //      (the master is the clock owner and tolerates input jitter).
@@ -14,9 +14,9 @@
 // .11 subinterface still tags the tunnel side; both relay interfaces are untagged.
 // PACKET_OUTGOING frames are skipped on both RX paths so we never echo our own TX.
 //
-// Usage: reac_repacer --in reactap.11 --out lan1 [--prefill-ms 12]
-//        [--period-ns 250000] [--cpu 3] [--prio 80] [--bcast-only] [--bypass]
-//        [--ctrl-bypass]
+// Usage: reac_repacer --in reactap.11 --out lan1 [--prefill-ms 8] [--adapt]
+//        [--reclaim] [--no-auto-rate] [--period-ns N] [--cpu 3] [--prio 80]
+//        [--bcast-only] [--no-plc] [--ctrl-bypass]
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -52,7 +52,7 @@ static uint16_t slot_len[RING_SZ];
 static volatile unsigned r_head, r_tail;           /* SPSC: fwd_rx produces, main consumes */
 
 static volatile sig_atomic_t running = 1;
-static unsigned long long n_rx, n_tx, n_drop_full, n_underrun, n_txerr, n_ret, n_reterr, n_ctrl, n_plc;
+static unsigned long long n_rx, n_tx, n_drop_full, n_underrun, n_txerr, n_ret, n_reterr, n_ctrl, n_plc, n_skip, n_hold;
 static unsigned long long g_in_frames;     /* every accepted input frame, for startup rate detection */
 static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
 static int g_servo_clamp_ppm = 3000;   /* servo period clamp (was a hardcoded ±500ppm,
@@ -62,6 +62,7 @@ static int g_adapt_margin = 10;     /* keep the occ low-water-mark this many slo
 static int g_adapt_min_ms  = 6;     /* floor latency when shrinking */
 static int g_adapt_max_ms  = 120;   /* ceiling latency when growing */
 static int g_plc = 1;               /* gap concealment: repeat last frame (next counter) on underrun */
+static int g_reclaim;               /* opt-in: actively shrink latency (drops -> clicks). Default grow-only. */
 static int g_occ_cap;               /* hard cap on audio buffer occupancy -> bounds latency */
 
 struct iface { int fd; int ifindex; struct sockaddr_ll tx; };
@@ -165,6 +166,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--adapt-max-ms") && i + 1 < argc) g_adapt_max_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
 		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
+		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
 	}
 	int prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 	if (prefill < 1) prefill = 1;
@@ -202,12 +204,12 @@ int main(int argc, char **argv) {
 				if (d < best) { best = d; snap = std_pps[i]; }
 			}
 			long chosen = (best < (double)snap * 0.08) ? snap : (long)(pps + 0.5);
-			period_ns = (long)(1.0e9 / (double)chosen + 0.5);
+			period_ns = (long)(1.0e9 / pps + 0.5);    /* freeze at the MEASURED rate, not the nominal */
 			prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 			if (prefill < 1) prefill = 1;
 			if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
-			fprintf(stderr, "auto-rate: %.0f pps measured -> %ld pps (%.1f kHz), period=%ld ns\n",
-			        pps, chosen, (double)chosen * 12.0 / 1000.0, period_ns);
+			fprintf(stderr, "auto-rate: %.0f pps measured (%.1f kHz), period frozen at %ld ns\n",
+			        pps, (double)chosen * 12.0 / 1000.0, period_ns);
 		} else {
 			fprintf(stderr, "auto-rate: no input seen; keeping period=%ld ns\n", period_ns);
 		}
@@ -227,15 +229,19 @@ int main(int argc, char **argv) {
 
 	long long deadline = ns_now() + period_ns; double period = (double)period_ns;
 	int target = prefill; long long last = ns_now();
-	long long occ_sum = 0; int occ_cnt = 0; double prev_avg = (double)prefill;
-	int servo_win = (int)(12.0e9 / (double)period_ns);   /* ~12 s of frames at ANY sample rate */
-	if (servo_win < 4000) servo_win = 4000;
+	long long occ_sum = 0; int occ_cnt = 0;
+	int edit_win = (int)(1.0e9 / (double)period_ns);   /* ~1 s of frames */
+	if (edit_win < 1000) edit_win = 1000;
+	int edit_owe = 0, edit_gap = 0;
+	int retune_win = (int)(8.0e9 / (double)period_ns);
+	if (retune_win < 8000) retune_win = 8000;
+	int retune_cnt = 0; long long retune_occ_sum = 0; double retune_avg0 = (double)prefill;
 	/* adaptive variable-window state: target tracks the observed burst depth */
 	int t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns);
 	int t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns);
 	if (t_floor < 4) t_floor = 4;
 	if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
-	int occ_min_win = 1 << 30, adapt_cnt = 0, calm = 0;
+	int occ_min_win = 1 << 30, adapt_cnt = 0, gh = 0, sd = 0;
 	/* PLC / output-counter state: the re-pacer owns a monotonic emit_ctr */
 	unsigned emit_ctr = 0; int last_idx = 0, have_last = 0;
 	uint8_t plc_buf[SLOT_SZ];
@@ -244,58 +250,68 @@ int main(int argc, char **argv) {
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
 		unsigned head = r_head, tail = __atomic_load_n(&r_tail, __ATOMIC_ACQUIRE);
 		int occ = (int)((tail - head) & RING_MASK);
-		if (occ > 0) {
-			uint8_t *f = slot_buf[head];
-			if (g_plc) {                                  /* own a monotonic output counter */
-				if (!have_last) emit_ctr = f[14] | (f[15] << 8);   /* seed from first frame */
-				f[14] = emit_ctr & 0xFF; f[15] = (emit_ctr >> 8) & 0xFF;
+		/* frozen-clock latency control: spread one scheduled frame-edit per tick. A drop
+		 * discards one buffered frame (occ down = latency down); an insert emits a hold
+		 * without consuming (occ up). Spaced out so each is an isolated, inaudible skip/hold. */
+		int do_drop = 0, do_insert = 0;
+		if (edit_owe != 0 && ++edit_gap >= 250) {
+			if (edit_owe > 0) { if (occ > target / 2 + 2) { do_drop = 1; edit_owe--; edit_gap = 0; } }
+			else { do_insert = 1; edit_owe++; edit_gap = 0; }
+		}
+		if (do_insert || occ <= 0) {
+			/* hold: repeat the last frame's audio under the next counter, consuming nothing -- used
+			 * both to raise latency (insert) and to conceal a real underrun. The monotonic emit_ctr
+			 * is essential: a verbatim repeat (dup counter) reads as 65535 lost frames at the slave. */
+			if (occ <= 0 && !do_insert) n_underrun++;
+			if (have_last) {
+				memcpy(plc_buf, slot_buf[last_idx], slot_len[last_idx]);
+				plc_buf[14] = emit_ctr & 0xFF; plc_buf[15] = (emit_ctr >> 8) & 0xFF;
+				if (sendto(OUT.fd, plc_buf, slot_len[last_idx], 0, (struct sockaddr *)&OUT.tx, sizeof OUT.tx) < 0) n_txerr++;
+				else { if (do_insert) n_hold++; else n_plc++; }
+				emit_ctr = (emit_ctr + 1) & 0xFFFF;
 			}
+		} else {
+			if (do_drop) { head = (head + 1) & RING_MASK; occ--; n_skip++; }   /* discard one frame's audio */
+			uint8_t *f = slot_buf[head];
+			if (!have_last) emit_ctr = f[14] | (f[15] << 8);                   /* seed the counter */
+			f[14] = emit_ctr & 0xFF; f[15] = (emit_ctr >> 8) & 0xFF;           /* own a monotonic output counter */
 			if (sendto(OUT.fd, f, slot_len[head], 0, (struct sockaddr *)&OUT.tx, sizeof OUT.tx) < 0) n_txerr++;
 			last_idx = (int)head; have_last = 1;
 			__atomic_store_n(&r_head, (head + 1) & RING_MASK, __ATOMIC_RELEASE); n_tx++;
 			emit_ctr = (emit_ctr + 1) & 0xFFFF;
-		} else {
-			n_underrun++;
-			/* gap concealment: re-send the last frame's audio with the NEXT counter, so
-			 * the stagebox still gets a packet every 250 us (clock stays locked) and hears
-			 * a brief HOLD instead of a click. The monotonic emit_ctr is essential — a
-			 * verbatim repeat (dup counter) reads as 65535 lost frames at the slave. */
-			if (g_plc && have_last) {
-				memcpy(plc_buf, slot_buf[last_idx], slot_len[last_idx]);
-				plc_buf[14] = emit_ctr & 0xFF; plc_buf[15] = (emit_ctr >> 8) & 0xFF;
-				if (sendto(OUT.fd, plc_buf, slot_len[last_idx], 0, (struct sockaddr *)&OUT.tx, sizeof OUT.tx) < 0) n_txerr++;
-				else n_plc++;
-				emit_ctr = (emit_ctr + 1) & 0xFFFF;
-			}
 		}
-		/* Clock-recovery servo: trim the emit period to hold buffer occupancy at
-		 * target. Gain-scheduled — a startup over/under-fill drains FAST (coarse
-		 * 30 ns step when >12 slots off) while a ±4-slot DEADBAND near target holds
-		 * the period dead still. A stationary period = a stable recovered word-clock
-		 * for the stagebox PLL (no wander — the ±2% servo's failure mode). The wide
-		 * ppm clamp lets the period reach the master's TRUE rate; the old ±500 ppm
-		 * clamp couldn't, so occ never converged and the achieved latency sat tens
-		 * of ms above the prefill setting. */
+		/* FROZEN clock + frame-edit latency control: the slot period never changes (set once from
+		 * the input rate) so the recovered word-clock is stationary -- no wander. Latency and the
+		 * residual rate offset are absorbed by the drops/inserts above. The edit budget comes from
+		 * the ~1 s average occupancy, so burst swings (absorbed by the buffer) never trigger an
+		 * edit, and the deadband keeps it idle once occ sits near target. */
 		occ_sum += occ; occ_cnt++;
-		if (occ_cnt >= servo_win) {                  /* ~12 s window: long enough that burst noise
-		                                              * averages out and the drift estimate ~= the
-		                                              * TRUE rate mismatch. */
-			double avg = (double)occ_sum / occ_cnt;
-			double drift = avg - prev_avg;           /* net occ change over the window = rate mismatch */
-			/* Cancel only a REAL rate mismatch (drift beyond the burst-noise floor); otherwise
-			 * leave the period FROZEN. A stationary period = a stationary recovered word-clock =
-			 * zero wander. No level term: occ is allowed to float (a steady clock matters far more
-			 * than hitting an exact occ; the buffer + PLC absorb the swings). RATE-INDEPENDENT:
-			 * the correction is the pure fractional drift over the window (drift/window_frames),
-			 * the period self-scales — no hardcoded packet rate, so it's correct at 44.1/48/96 k. */
-			if (drift > 3.0 || drift < -3.0)
-				period -= period * drift / (double)servo_win;
-			prev_avg = avg;
-			double span = (double)period_ns / 1000000.0 * (double)g_servo_clamp_ppm;
-			double lo = period_ns - span, hi = period_ns + span;
-			if (period < lo) period = lo;
-			if (period > hi) period = hi;
+		if (occ_cnt >= edit_win) {
+			double err = (double)occ_sum / occ_cnt - (double)target;
+			if (err > 32.0 || err < -32.0) {
+				edit_owe = (int)err;
+				if (edit_owe >  48) edit_owe =  48;
+				if (edit_owe < -48) edit_owe = -48;
+			} else edit_owe = 0;
 			occ_sum = 0; occ_cnt = 0;
+		}
+		/* slow period re-tune: nudge the frozen period to null the net edit rate. A steady
+		 * surplus of drops means occ keeps creeping up (period a hair too long) -> shorten it;
+		 * a surplus of holds means the opposite -> lengthen it. Tiny, ~8 s-spaced nudges nail
+		 * the true source rate so steady-state edits fall to ~0, without moving the clock
+		 * enough to wander (unlike a per-occupancy servo). */
+		retune_occ_sum += occ;
+		if (++retune_cnt >= retune_win) {
+			double avg = (double)retune_occ_sum / retune_cnt;
+			double d = avg - retune_avg0;
+			retune_avg0 = avg;
+			if (d > 1.0 || d < -1.0) {
+				double n = (double)period * d / (double)retune_win; if (n > 8.0) n = 8.0; if (n < -8.0) n = -8.0;
+				period -= n;
+				if (period < (double)period_ns * 0.997) period = (double)period_ns * 0.997;
+				if (period > (double)period_ns * 1.003) period = (double)period_ns * 1.003;
+			}
+			retune_occ_sum = 0; retune_cnt = 0;
 		}
 		/* Variable window: size the buffer to the OBSERVED burst depth. Track the occ
 		 * low-water-mark over ~1 s; if it dips into the safety margin, grow the target
@@ -306,9 +322,13 @@ int main(int argc, char **argv) {
 			if (occ < occ_min_win) occ_min_win = occ;
 			if (++adapt_cnt >= 4000) {                 /* ~1 s */
 				int m = g_adapt_margin;
-				if (occ_min_win < m) { target += 2 * (m - occ_min_win) + 4; calm = 0; }  /* grow fast */
-				else if (occ_min_win > m + 16) { if (++calm >= 3) { target -= 2; calm = 0; } }  /* shrink slow */
-				else calm = 0;
+				if (gh > 0) gh--;
+				if (sd > 0) sd--;
+				if (occ_min_win < m && gh == 0) { target += 16; gh = 2; sd = 60; }  /* grow on a dip -> RF-safe, then SETTLE (stop diving) for a clean hold at the floor */
+				else if (g_reclaim && occ_min_win > m + 6 && sd == 0) {   /* opt-in reclaim: dive toward the floor (drops -> clicks) */
+					int sh = 1 + (occ_min_win - m) / 4; if (sh > 16) sh = 16;
+					target -= sh;
+				}
 				if (target < t_floor) target = t_floor;
 				if (target > t_ceil)  target = t_ceil;
 				occ_min_win = 1 << 30; adapt_cnt = 0;
@@ -317,8 +337,8 @@ int main(int argc, char **argv) {
 		deadline += (long long)(period + 0.5);
 		long long now = ns_now();
 		if (now - last > 2000000000LL) {
-			fprintf(stderr, "  fwd rx=%llu tx=%llu occ=%d tgt=%d(%dms) per=%.0f drop=%llu under=%llu plc=%llu txerr=%llu | ctrl=%llu ret=%llu reterr=%llu\n",
-			        n_rx, n_tx, occ, target, (int)((long long)target * period_ns / 1000000), period, n_drop_full, n_underrun, n_plc, n_txerr, n_ctrl, n_ret, n_reterr);
+			fprintf(stderr, "  rx=%llu tx=%llu occ=%d(%dms) tgt=%d per=%.0f skip=%llu hold=%llu under=%llu plc=%llu | ctrl=%llu ret=%llu\n",
+			        n_rx, n_tx, occ, (int)((long long)occ * period_ns / 1000000), target, period, n_skip, n_hold, n_underrun, n_plc, n_ctrl, n_ret);
 			last = now;
 		}
 	}
