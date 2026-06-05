@@ -434,6 +434,7 @@ int main(int argc, char **argv) {
 	double bias_ppm = 0.0, servo_integ = 0.0;
 	double max_ppm = (double)g_servo_clamp_ppm;
 	int servo_div = 0;
+	int drift_div = 0; double drift_prev = 1e9;   /* base tracker: null long-term occ-vs-target drift */
 	/* ONE shared target for all ports (they share a clock + a source). Sized to the worst
 	 * low-water dip across ports + margin: grow at once to cover a burst, ease down ~1 slot/4s
 	 * when calm. The servo then steers the tightest port's smoothed occupancy onto it. */
@@ -494,6 +495,23 @@ int main(int argc, char **argv) {
 			servo_div = 0;
 		}
 
+		/* base-rate tracker (slow): shift the frozen base period ONLY when the fast servo is
+		 * RAILED and occ is STILL drifting away from target in the rail's direction -- i.e. the
+		 * servo is maxed but losing, which only happens when the base rate is off by more than the
+		 * clamp. This ignores the startup/reclaim drain (servo railed but occ moving TOWARD target)
+		 * and fast jitter. The fast servo (16 ms) handles jitter; this (5 s) corrects the systematic
+		 * clock offset the 2 s startup estimate missed. Self-stopping; auto-rate only. */
+		if (g_auto_rate && have && ++drift_div >= 40000) {
+			double rel = min_ema - shtgt;
+			if (drift_prev < 1e8) {
+				double dd = rel - drift_prev;                          /* occ-vs-target drift over the window */
+				if (bias_ppm >= max_ppm - 1.0 && dd > 2.0)            /* servo maxed-draining yet occ STILL rising -> base too slow */
+					period_ns = (long)((double)period_ns * (1.0 - 200e-6) + 0.5);
+				else if (bias_ppm <= -max_ppm + 1.0 && dd < -2.0)     /* servo maxed-filling yet occ STILL falling -> base too fast */
+					period_ns = (long)((double)period_ns * (1.0 + 200e-6) + 0.5);
+			}
+			drift_prev = rel; drift_div = 0;
+		}
 		deadline += (long long)(period + 0.5);
 		long long now = ns_now();
 		if (now - last > 1000000000LL) {
@@ -515,7 +533,7 @@ int main(int argc, char **argv) {
 				if (prefill < 1) prefill = 1;
 				if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
 				bias_ppm = 0; servo_integ = 0; servo_div = 0;
-				shtgt = (double)prefill; adapt_div = 0;
+				shtgt = (double)prefill; adapt_div = 0; drift_prev = 1e9;
 				t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
 				t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
 				for (int i = 0; i < n_streams; i++) {
