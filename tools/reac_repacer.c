@@ -30,8 +30,13 @@
 // Usage: reac_repacer --port reactap.11:lan1 --port reactap.12:lan2
 //          --port reactap.13:lan3 [--prefill-ms 8] [--adapt] [--reclaim]
 //          [--no-auto-rate] [--period-ns N] [--cpu 3] [--prio 80]
-//          [--bcast-only] [--no-plc] [--ctrl-bypass]
+//          [--bcast-only] [--no-plc] [--ctrl-bypass] [--forward-only]
 //        (single port also accepts the legacy  --in IFACE --out IFACE  form.)
+//
+// --forward-only: de-jitter only the forward (IN->OUT) direction and do NOT run the
+//   return pass-through thread. Used on the MIXER side (IN=tunnel, OUT=mixer): the
+//   upstream box->master is de-jittered, while the downstream master->box is left on
+//   the kernel bridge (lossless) instead of a starvable user-space pass-through.
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -72,6 +77,10 @@ static volatile sig_atomic_t running = 1;
 
 /* global config (identical for every port) */
 static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
+static int g_forward_only;           /* de-jitter the forward (IN->OUT) only; leave the return
+                                      * (OUT->IN) to the kernel bridge -- lossless, no pass-through
+                                      * thread to starve. Used on the mixer side, where the
+                                      * downstream (master->box) must stay on the bridge. */
 static int g_servo_clamp_ppm = 700;    /* drain-servo clock-bias clamp (ppm). ~1.2 cents at 700 --
                                         * inaudible as a steady offset; bounds how fast latency is
                                         * reclaimed (latency falls ~ppm microseconds per second). */
@@ -322,6 +331,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
 		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
 		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
+		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
 	}
 	if (pend_in && pend_out) add_stream(pend_in, pend_out);   /* legacy single-port form */
 	if (n_streams == 0) add_stream("reactap.11", "lan1");     /* default */
@@ -348,7 +358,7 @@ int main(int argc, char **argv) {
 
 	for (int i = 0; i < n_streams; i++) {
 		pthread_create(&streams[i].rx_th, NULL, fwd_rx, &streams[i]);
-		pthread_create(&streams[i].ret_th, NULL, ret_relay, &streams[i]);
+		if (!g_forward_only) pthread_create(&streams[i].ret_th, NULL, ret_relay, &streams[i]);
 	}
 
 	/* one RT pacing thread (this one) on a dedicated core, isolated from the NIC IRQ core */
@@ -372,7 +382,11 @@ int main(int argc, char **argv) {
 			long snap = nearest_std_pps(pps);
 			double err = pps - (double)snap; if (err < 0) err = -err;
 			double chosen = (err < (double)snap * 0.08) ? (double)snap : pps;
-			period_ns = (long)(1.0e9 / pps + 0.5);    /* freeze at the MEASURED rate */
+			period_ns = (long)(1.0e9 / pps + 0.5);    /* freeze at the MEASURED rate: this IS the master's
+			                                            * true frame rate (~8011-8029 @96k, NOT exactly 8000),
+			                                            * so the de-jitter emit matches the producer and the
+			                                            * ring never drifts. nearest_std (chosen) is only a
+			                                            * family label + sanity gate, never the emit clock. */
 			prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 			if (prefill < 1) prefill = 1;
 			if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
@@ -387,8 +401,8 @@ int main(int argc, char **argv) {
 			__atomic_store_n(&streams[i].r_head, __atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 	}
 
-	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d\n",
-	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim);
+	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d fwd_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d\n",
+	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_forward_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim);
 	for (int i = 0; i < n_streams; i++)
 		fprintf(stderr, "  port %d: %s -> %s\n", i, streams[i].in_name, streams[i].out_name);
 
@@ -496,7 +510,7 @@ int main(int argc, char **argv) {
 			int is_change = (g_auto_rate && in_pps > 2000.0 && cerr < 0.03 && cand != nearest_std_pps(1.0e9 / period_ns));
 			if (is_change) rate_chg++; else rate_chg = 0;
 			if (rate_chg >= 3) {   /* a standard rate sustained ~3 s -> a real (rare) change */
-				rate_chg = 0; period_ns = (long)(1.0e9 / (double)cand + 0.5); period = (double)period_ns;
+				rate_chg = 0; period_ns = (long)(1.0e9 / in_pps + 0.5); period = (double)period_ns;  /* emit at the MEASURED rate of the new family (cand only DETECTS the change) */
 				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 				if (prefill < 1) prefill = 1;
 				if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
