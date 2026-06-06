@@ -62,7 +62,7 @@
 #define PACKET_QDISC_BYPASS 20
 #endif
 
-#define RING_BITS 11
+#define RING_BITS 14   /* TEST: ~2 s ring so a 1 s passive buffer fits (prod = 11) */
 #define RING_SZ   (1 << RING_BITS)
 #define RING_MASK (RING_SZ - 1)
 #define SLOT_SZ   1600
@@ -90,6 +90,19 @@ static int g_adapt_min_ms  = 6;     /* floor latency when shrinking */
 static int g_adapt_max_ms  = 120;   /* ceiling latency when growing */
 static int g_plc = 1;               /* gap concealment: repeat last frame (next counter) on underrun */
 static int g_reclaim;               /* opt-in: actively shrink latency (drops -> clicks). Default grow-only. */
+static int g_pll;                   /* glacial frequency-lock: converge BASE period to null occ drift */
+/* The PLL: every PLL_WIN ticks, nudge the base period to (a) zero the mean-occupancy
+ * drift over the window [frequency] and (b) gently recenter occ on the target [position].
+ * Each step is clamped tiny (PLL_MAXPPM) so there is NO audible rate modulation; the
+ * residual halves each window until refinement gains nothing -> a constant exact rate.
+ * Runs with the fast servo OFF (--servo-clamp-ppm 0), preserving constant-rate clarity. */
+#define PLL_WIN     32000   /* correction window in ticks (~4 s @ 8000 fps) */
+#define PLL_FGAIN   0.6     /* frequency gain: fraction of measured drift corrected per window */
+#define PLL_PGAIN   0.12    /* position gain: gentle recenter toward target */
+#define PLL_MAXPPM  500.0   /* max base-period step per window (ppm) -- keeps each step inaudible */
+static double g_pll_fgain = PLL_FGAIN;   /* runtime override (--pll-fgain) */
+static double g_pll_pgain = PLL_PGAIN;   /* runtime override (--pll-pgain); 0 = pure frequency-lock, no recenter */
+static int    g_pll_pos_min = 0;         /* position-control source: 0=mean depth (default), 1=tightest port (--pll-pos-min) */
 
 struct iface { int fd; int ifindex; struct sockaddr_ll tx; };
 
@@ -121,6 +134,7 @@ struct stream {
 	uint8_t plc_buf[SLOT_SZ];
 
 	pthread_t rx_th, ret_th;
+	int rx_cpu;                     /* core the rx reader is pinned to (!= the RT pacer core) */
 };
 
 static struct stream streams[MAX_STREAMS];
@@ -142,7 +156,8 @@ static int open_iface(const char *name, struct iface *o) {
 	struct sockaddr_ll sll; memset(&sll, 0, sizeof sll);
 	sll.sll_family = AF_PACKET; sll.sll_protocol = htons(ETH_P_ALL); sll.sll_ifindex = ifr.ifr_ifindex;
 	if (bind(s, (struct sockaddr *)&sll, sizeof sll) < 0) { perror("bind"); close(s); return -1; }
-	int rcv = 8 * 1024 * 1024; setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
+	int rcv = 32 * 1024 * 1024;   /* burst headroom: 43 ms WDS bursts must not overflow the reader's socket */
+	if (setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &rcv, sizeof rcv) < 0) setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
 	if (g_bypass) { int one = 1; setsockopt(s, SOL_PACKET, PACKET_QDISC_BYPASS, &one, sizeof one); }
 	o->fd = s; o->ifindex = ifr.ifr_ifindex;
 	memset(&o->tx, 0, sizeof o->tx);
@@ -153,6 +168,10 @@ static int open_iface(const char *name, struct iface *o) {
 /* forward RX: tunnel master broadcast -> this stream's ring */
 static void *fwd_rx(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
+	if (s->rx_cpu >= 0) {   /* pin off the RT pacer core so the pacer can't preempt this reader mid-burst */
+		cpu_set_t set; CPU_ZERO(&set); CPU_SET(s->rx_cpu, &set);
+		sched_setaffinity(0, sizeof set, &set);
+	}
 	while (recv(s->IN.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;   /* flush stale backlog -> no startup overshoot */
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
@@ -225,23 +244,30 @@ static void stream_resize(struct stream *s, long period_ns, int prefill) {
  * spread one scheduled frame-edit per tick (drop = latency down, hold = latency up),
  * conceal underruns, and size this port's buffer to its own burst depth. Returns the
  * port's current occupancy; sets *active when the port has real data flowing. */
-static int pace_one(struct stream *s, int *active) {
+static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, int join_depth) {
 	/* a port that has never received a frame stays dormant: no emit, no underrun
 	 * count, no buffer growth. It wakes up cleanly the instant input appears (e.g.
 	 * a stagebox patched in after the daemon is already running). */
 	if (s->n_rx == 0) { *active = 0; return 0; }
 	unsigned head = s->r_head, tail = __atomic_load_n(&s->r_tail, __ATOMIC_ACQUIRE);
 	int occ = (int)((tail - head) & RING_MASK);
-	/* per-port activation: a port that just started receiving (at daemon start or
-	 * hot-patched mid-run) prefills its own buffer before emitting, so it joins the
-	 * shared clock cleanly instead of underrunning until it fills. */
+	/* UNISON occupancy-anchored activation: gate the FIRST emit on the COMMON floor, not this
+	 * port's own prefill, so every port begins at the same depth = the same output delay. A
+	 * shallow port DEFERS (keeps filling, does NOT emit) until it reaches the floor -- this ADDS
+	 * buffer, never drops a frame, so it is click-free at lock. Pre eq_done the floor is the
+	 * snapshotted common floor (the barrier); post eq_done a late/idle hot-joiner gates on
+	 * join_depth = the peers' live running depth, so it joins delay-matched. ONE-TIME: once
+	 * s->started it is never re-armed (only a rate-change relock re-arms). */
 	if (!s->started) {
-		if (occ < s->prefill) { *active = 0; return occ; }
+		int floor = eq_done ? join_depth : eq_floor;
+		if (floor < 1) floor = 1;
+		if (floor > s->occ_cap - 1) floor = s->occ_cap - 1;   /* deadlock guard: rx drops at occ_cap, so the gate must be reachable */
+		if (occ < floor) { *active = 0; return occ; }          /* DEFER: keep filling, do not emit yet */
 		s->started = 1;
-		s->target = s->prefill;
-		s->occ_ema = (double)s->prefill;
+		s->target = floor;
+		s->occ_ema = (double)floor;
 		s->occ_min_win = 1 << 30; s->adapt_cnt = 0; s->gh = 0; s->sd = 0;
-		fprintf(stderr, "port %s->%s: REAC detected, prefilled -> active\n", s->in_name, s->out_name);
+		fprintf(stderr, "port %s->%s: REAC detected, filled to common depth %d -> active\n", s->in_name, s->out_name, floor);
 	}
 	/* Latency is controlled ONLY by the shared clock rate (the drain servo in the pacing
 	 * loop), never by dropping or holding frames -- so a clean signal is never clicked.
@@ -331,6 +357,10 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
 		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
 		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
+		else if (!strcmp(argv[i], "--pll")) g_pll = 1;
+		else if (!strcmp(argv[i], "--pll-fgain") && i + 1 < argc) g_pll_fgain = atof(argv[++i]);
+		else if (!strcmp(argv[i], "--pll-pgain") && i + 1 < argc) g_pll_pgain = atof(argv[++i]);
+		else if (!strcmp(argv[i], "--pll-pos-min")) g_pll_pos_min = 1;
 		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
 	}
 	if (pend_in && pend_out) add_stream(pend_in, pend_out);   /* legacy single-port form */
@@ -338,7 +368,7 @@ int main(int argc, char **argv) {
 
 	int prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 	if (prefill < 1) prefill = 1;
-	if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
+	if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
 
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
 
@@ -355,6 +385,20 @@ int main(int argc, char **argv) {
 		s->occ_min_win = 1 << 30;
 	}
 	mlockall(MCL_CURRENT | MCL_FUTURE);
+
+	/* pin each rx reader to its own core, NEVER the RT pacer's core (cpu) and -- when there is
+	 * room -- not the eth-IRQ core 0, so the SCHED_FIFO pacer cannot preempt a reader mid-burst
+	 * and overflow its socket (that preemption was the asymmetric per-port ingest "loss"). */
+	int ncores = (int)sysconf(_SC_NPROCESSORS_ONLN); if (ncores < 1) ncores = 1;
+	int rxc[8], nc = 0;
+	for (int c = 0; c < ncores && nc < 8; c++) {
+		if (c == cpu) continue;
+		if (ncores > 2 && c == 0) continue;
+		rxc[nc++] = c;
+	}
+	if (nc == 0) for (int c = 0; c < ncores && nc < 8; c++) { if (c != cpu) rxc[nc++] = c; }
+	if (nc == 0) rxc[nc++] = cpu;
+	for (int i = 0; i < n_streams; i++) streams[i].rx_cpu = rxc[i % nc];
 
 	for (int i = 0; i < n_streams; i++) {
 		pthread_create(&streams[i].rx_th, NULL, fwd_rx, &streams[i]);
@@ -389,7 +433,7 @@ int main(int argc, char **argv) {
 			                                            * family label + sanity gate, never the emit clock. */
 			prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 			if (prefill < 1) prefill = 1;
-			if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
+			if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
 			for (int i = 0; i < n_streams; i++) stream_resize(&streams[i], period_ns, prefill);
 			fprintf(stderr, "auto-rate: %.0f pps measured (%.1f kHz), period frozen at %ld ns\n",
 			        pps, chosen * 12.0 / 1000.0, period_ns);
@@ -406,6 +450,72 @@ int main(int argc, char **argv) {
 	for (int i = 0; i < n_streams; i++)
 		fprintf(stderr, "  port %d: %s -> %s\n", i, streams[i].in_name, streams[i].out_name);
 
+	/* INGEST SETTLE: at daemon start the WDS/zone delivery ramps -- one zone can lag the other
+	 * by ~1600 fps for ~2 s (measured), a startup loss that drains that port to empty and, under
+	 * the shared clock, FREEZES a delay offset (the "B behind" spread). Wait until every active
+	 * port's input rate is full + matched across ports for 2 consecutive seconds, DISCARDING input
+	 * meanwhile, so the prefill barrier below then fills both ports cleanly + equally and they lock
+	 * in unison. Uses g_in_frames (true ingest, counted before the ring) so discarding is free. */
+	{
+		unsigned long long base[MAX_STREAMS];
+		long long t0 = ns_now();
+		for (int i = 0; i < n_streams; i++) base[i] = streams[i].g_in_frames;
+		int good = 0, settle_iter = 0;
+		double matched_pps = 0;
+		while (running && good < 2 && settle_iter < 30) {   /* cap ~30 s so a single-port rig still starts */
+			struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL); settle_iter++;
+			long long now = ns_now(); double secs = (double)(now - t0) / 1.0e9; t0 = now;
+			double mx = 0, mn = 1e18; int any = 0;
+			for (int i = 0; i < n_streams; i++) {
+				unsigned long long d = streams[i].g_in_frames - base[i];
+				base[i] = streams[i].g_in_frames;
+				double r = secs > 0 ? (double)d / secs : 0;
+				if (r < 100.0) continue;                 /* idle/dormant port: not required */
+				any = 1;
+				if (r > mx) mx = r;
+				if (r < mn) mn = r;
+			}
+			if (any && mx > 0 && (mx - mn) / mx < 0.01) { good++; matched_pps = mx; }  /* matched within 1%; fastest port = least-lossy = master rate */
+			else good = 0;
+			for (int i = 0; i < n_streams; i++)          /* discard the ramp so rings start fresh after it */
+				__atomic_store_n(&streams[i].r_head, __atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+		}
+		/* now that ingest is stable+matched, take an ACCURATE rate over ~4 s (a single 1 s settle
+		 * delta is too noisy -> a low second sets the period too slow -> occ fills deep). Average the
+		 * fastest (least-lossy) port = the master rate. */
+		if (g_auto_rate && running && matched_pps > 100.0) {
+			unsigned long long b2[MAX_STREAMS]; long long tm = ns_now();
+			for (int i = 0; i < n_streams; i++) b2[i] = streams[i].g_in_frames;
+			struct timespec ms4 = { 4, 0 }; nanosleep(&ms4, NULL);
+			double secs2 = (double)(ns_now() - tm) / 1.0e9, best = 0;
+			for (int i = 0; i < n_streams; i++) {
+				double r = secs2 > 0 ? (double)(streams[i].g_in_frames - b2[i]) / secs2 : 0;
+				if (r > best) best = r;
+			}
+			if (best > 100.0) matched_pps = best;
+			for (int i = 0; i < n_streams; i++)   /* discard the measurement fill -> rings fresh for the barrier */
+				__atomic_store_n(&streams[i].r_head, __atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+		}
+		/* Use the settle's multi-second rate measurement to set the emit clock -- far more accurate
+		 * than the 2 s auto-rate seed, so occ holds at prefill with NO convergence fill = controlled
+		 * latency. Auto mode only (a forced --period-ns is respected). The PLL then trims the residual. */
+		if (g_auto_rate && matched_pps > 100.0) {
+			/* seed the EXACT standard frame rate (96k=8000 fps), not the bursty WDS measurement --
+			 * any window over the jittery delivery scatters +/- several % (a correlated both-ports dip
+			 * even passes the matched check) -> a wrong absolute seed bloats to the ring cap or drains.
+			 * The master is within ~0.05% of the standard; the PLL nulls that tiny residual exactly. */
+			long std = nearest_std_pps(matched_pps);
+			double seed = (matched_pps > (double)std * 0.85 && matched_pps < (double)std * 1.15) ? (double)std : matched_pps;  /* wide window: the RETURN path measures up to ~10% low (WDS loss) but its true rate is still the master standard */
+			period_ns = (long)(1.0e9 / seed + 0.5);
+			prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
+			if (prefill < 1) prefill = 1;
+			if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;
+			for (int i = 0; i < n_streams; i++) stream_resize(&streams[i], period_ns, prefill);
+		}
+		fprintf(stderr, "repacer: ingest settled in %d s, rate=%.1f pps, period=%ld ns -> filling\n",
+		        settle_iter, matched_pps, period_ns);
+	}
+
 	/* pace once EVERY actively-receiving port has prefilled (not just the first) -- otherwise
 	 * a port that fills slower than its peers starts pacing under-filled and underruns at
 	 * startup. Ports with no input yet (n_rx==0) don't block the start; they join cleanly
@@ -421,7 +531,23 @@ int main(int argc, char **argv) {
 		if (any_active && all_ready) break;
 		struct timespec ts = { 0, 1000000 }; nanosleep(&ts, NULL);
 	}
-	fprintf(stderr, "repacer: prefilled, pacing\n");
+	/* UNISON occupancy-anchored start: snapshot every active port's ring occupancy at ONE
+	 * instant and set the COMMON start floor = max(prefill, max occ across active ports). Every
+	 * port then gates its FIRST emit on eq_floor (shallow ports DEFER -> add buffer, never drop),
+	 * so all ports begin at the SAME depth = the SAME output delay. Pure wall-clock OCCUPANCY
+	 * (per-zone REAC counters are independent sequences). Anchoring everyone UP to the deepest
+	 * honours "raise the buffer for ALL" (one common safe window >= --prefill-ms). */
+	int eq_floor = prefill;       /* common start occupancy (frames); >= prefill = --prefill-ms */
+	int eq_done  = 0;             /* latched once all initially-active ports reach the floor + begin */
+	for (int i = 0; i < n_streams; i++) {
+		if (streams[i].n_rx == 0) continue;
+		int occ = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE)
+		                 - streams[i].r_head) & RING_MASK);
+		if (occ > eq_floor) eq_floor = occ;   /* anchor everyone UP to the deepest */
+	}
+	if (eq_floor > streams[0].occ_cap - 1) eq_floor = streams[0].occ_cap - 1;
+	fprintf(stderr, "repacer: prefilled, pacing (eq_floor=%d frames = %d ms)\n",
+	        eq_floor, (int)((long long)eq_floor * period_ns / 1000000));
 
 	long long deadline = ns_now() + period_ns; double period = (double)period_ns;
 	long long last = ns_now();
@@ -435,6 +561,7 @@ int main(int argc, char **argv) {
 	double max_ppm = (double)g_servo_clamp_ppm;
 	int servo_div = 0;
 	int drift_div = 0; double drift_prev = 1e9;   /* base tracker: null long-term occ-vs-target drift */
+	int pll_div = 0; double pll_ref = -1.0;        /* glacial PLL: converge base period to null occ drift */
 	/* ONE shared target for all ports (they share a clock + a source). Sized to the worst
 	 * low-water dip across ports + margin: grow at once to cover a burst, ease down ~1 slot/4s
 	 * when calm. The servo then steers the tightest port's smoothed occupancy onto it. */
@@ -448,10 +575,24 @@ int main(int argc, char **argv) {
 		struct timespec d = { deadline / 1000000000LL, deadline % 1000000000LL };
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
 
-		/* emit every port on this shared tick */
+		/* emit every port on this shared tick. Pre eq_done shallow ports DEFER to the common
+		 * floor; post eq_done a late/idle hot-joiner gates on the peers' live running depth so it
+		 * joins delay-matched. With --servo-clamp-ppm 0 shtgt stays == prefill. */
+		int join_depth = (int)(shtgt + SERVO_SETPOINT + 0.5);
 		for (int i = 0; i < n_streams; i++) {
 			int active = 0;
-			pace_one(&streams[i], &active);
+			pace_one(&streams[i], &active, eq_floor, eq_done, join_depth);
+		}
+		/* latch the occupancy-anchored start once every initially-active port has begun. ONE-TIME;
+		 * only re-armed on a rate-change relock. This also un-freezes the PLL below. */
+		if (!eq_done) {
+			int all_started = 1, any = 0;
+			for (int i = 0; i < n_streams; i++) {
+				if (streams[i].n_rx == 0) continue;
+				any = 1;
+				if (!streams[i].started) all_started = 0;
+			}
+			if (any && all_started) eq_done = 1;
 		}
 		/* tightest smoothed occupancy across active ports -> the servo input */
 		double min_ema = 1e9; int have = 0;
@@ -465,7 +606,7 @@ int main(int argc, char **argv) {
 		 * this second -- offset-independent (a port sitting higher from a past underrun does
 		 * not inflate it). need = max(D) + margin. Grow at once to cover a bigger burst;
 		 * ease toward the requirement exponentially when calmer (reclaim latency, no drops). */
-		if (have && ++adapt_div >= 4000) {
+		if (g_adapt && have && ++adapt_div >= 4000) {
 			double maxD = 0;
 			for (int i = 0; i < n_streams; i++) {
 				if (!streams[i].started || streams[i].n_rx == 0) continue;
@@ -501,7 +642,7 @@ int main(int argc, char **argv) {
 		 * clamp. This ignores the startup/reclaim drain (servo railed but occ moving TOWARD target)
 		 * and fast jitter. The fast servo (16 ms) handles jitter; this (5 s) corrects the systematic
 		 * clock offset the 2 s startup estimate missed. Self-stopping; auto-rate only. */
-		if (g_auto_rate && have && ++drift_div >= 40000) {
+		if (g_auto_rate && max_ppm > 0.5 && have && ++drift_div >= 40000) {
 			double rel = min_ema - shtgt;
 			if (drift_prev < 1e8) {
 				double dd = rel - drift_prev;                          /* occ-vs-target drift over the window */
@@ -511,6 +652,27 @@ int main(int argc, char **argv) {
 					period_ns = (long)((double)period_ns * (1.0 + 200e-6) + 0.5);
 			}
 			drift_prev = rel; drift_div = 0;
+		}
+		/* glacial frequency-lock (the converging PLL). Self-stopping: as the drift goes to
+		 * zero the correction goes to zero -> a constant exact rate, no audible modulation. */
+		if (g_pll && eq_done && have && ++pll_div >= PLL_WIN) {
+			double msum = 0; int mc = 0;
+			for (int i = 0; i < n_streams; i++)
+				if (streams[i].started && streams[i].n_rx) { msum += streams[i].occ_ema; mc++; }
+			if (mc) {
+				double mocc = msum / mc;
+				if (pll_ref < 0) pll_ref = mocc;
+				double docc = mocc - pll_ref;                                   /* drift over the window */
+				double pos  = g_pll_pos_min ? min_ema : mocc;                          /* recenter source: tightest port or mean depth */
+				double adj  = -(docc / (double)PLL_WIN) * 1e6 * g_pll_fgain              /* freq: null the (parallel) mean drift */
+				              - ((pos - shtgt) / (double)PLL_WIN) * 1e6 * g_pll_pgain;   /* pos: gentle recenter toward the safe window (rule 5; clean equal start makes mean-recenter drain both equally) */
+				if (adj >  PLL_MAXPPM) adj =  PLL_MAXPPM;
+				else if (adj < -PLL_MAXPPM) adj = -PLL_MAXPPM;
+				period_ns = (long)((double)period_ns * (1.0 + adj * 1e-6) + 0.5);
+				period = (double)period_ns * (1.0 - bias_ppm * 1e-6);
+				pll_ref = mocc;
+			}
+			pll_div = 0;
 		}
 		deadline += (long long)(period + 0.5);
 		long long now = ns_now();
@@ -531,7 +693,7 @@ int main(int argc, char **argv) {
 				rate_chg = 0; period_ns = (long)(1.0e9 / in_pps + 0.5); period = (double)period_ns;  /* emit at the MEASURED rate of the new family (cand only DETECTS the change) */
 				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 				if (prefill < 1) prefill = 1;
-				if (prefill > RING_SZ - 2) prefill = RING_SZ - 2;
+				if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
 				bias_ppm = 0; servo_integ = 0; servo_div = 0;
 				shtgt = (double)prefill; adapt_div = 0; drift_prev = 1e9;
 				t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
@@ -540,14 +702,38 @@ int main(int argc, char **argv) {
 					streams[i].have_last = 0;
 					stream_relock(&streams[i], period_ns, prefill);
 				}
-				while (running) {
-					int ready = 0;
-					for (int i = 0; i < n_streams; i++) { int o = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE) - streams[i].r_head) & RING_MASK); if (o >= prefill) { ready = 1; break; } }
-					if (ready) break;
-					struct timespec rt = { 0, 1000000 }; nanosleep(&rt, NULL);
+				/* all-ports-armed relock barrier with stalled-port bypass: a port whose input
+				 * stopped keeps n_rx!=0 but never refills, so don't wait forever on it (else all
+				 * ports freeze). Bypass a port whose n_rx hasn't advanced 300 ms after entry. */
+				{
+					unsigned long long rb[MAX_STREAMS];
+					for (int i = 0; i < n_streams; i++) rb[i] = streams[i].n_rx;
+					long long t_barr = ns_now();
+					while (running) {
+						int any_active = 0, all_ready = 1;
+						for (int i = 0; i < n_streams; i++) {
+							if (streams[i].n_rx == 0) continue;
+							if (streams[i].n_rx == rb[i] && ns_now() - t_barr > 300000000LL) continue;
+							any_active = 1;
+							int o = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE) - streams[i].r_head) & RING_MASK);
+							if (o < prefill) all_ready = 0;
+						}
+						if (any_active && all_ready) break;
+						struct timespec rt = { 0, 1000000 }; nanosleep(&rt, NULL);
+					}
 				}
+				/* UNISON: re-arm the occupancy-anchor at the new rate -- re-snapshot the common floor
+				 * and clear eq_done (stream_relock already set started=0) so every port re-gates on the
+				 * new floor; reseed the PLL so it re-converges from the new equalized state. */
+				eq_floor = prefill; eq_done = 0; pll_ref = -1.0; pll_div = 0;
+				for (int i = 0; i < n_streams; i++) {
+					if (streams[i].n_rx == 0) continue;
+					int occ = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE) - streams[i].r_head) & RING_MASK);
+					if (occ > eq_floor) eq_floor = occ;
+				}
+				if (eq_floor > streams[0].occ_cap - 1) eq_floor = streams[0].occ_cap - 1;
 				for (int i = 0; i < n_streams; i++) streams[i].last_in = streams[i].g_in_frames;
-				fprintf(stderr, "auto-rate: input rate changed to %.0f pps (%.1f kHz) -> re-locked all ports, period=%ld ns\n", in_pps, in_pps * 12.0 / 1000.0, period_ns);
+				fprintf(stderr, "auto-rate: input rate changed to %.0f pps (%.1f kHz) -> re-locked all ports, period=%ld ns, eq_floor=%d\n", in_pps, in_pps * 12.0 / 1000.0, period_ns, eq_floor);
 				deadline = ns_now() + period_ns; last = ns_now(); continue;
 			}
 			/* per-port telemetry line */
