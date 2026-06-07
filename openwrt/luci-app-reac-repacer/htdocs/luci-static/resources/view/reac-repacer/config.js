@@ -29,10 +29,13 @@ return view.extend({
 			_('Master on/off for the whole re-pacer.'));
 		o.rmempty = false;
 
-		o = s.option(form.Value, 'prefill_ms', _('Startup buffer (ms)'),
-			_('Initial de-jitter buffer. The relay sizes the buffer to the observed ' +
-			  'burst depth and drains down toward the clean floor from here.'));
-		o.datatype = 'range(1,200)';
+		o = s.option(form.Value, 'prefill_ms', _('Target buffer (ms)'),
+			_('De-jitter buffer depth. The relay sizes the buffer to the observed ' +
+			  'burst depth and drains down toward the clean floor from here. ' +
+			  'Save &amp; Apply retunes the running daemon live (no audio dropout) — ' +
+			  'the latency walks to the new value. For instant by-ear tuning without ' +
+			  'a save, run: ubus call reac_repacer set \'{"prefill_ms":150}\'.'));
+		o.datatype = 'range(1,1000)';
 		o.default = '16';
 
 		o = s.option(form.Flag, 'auto_rate', _('Auto rate'),

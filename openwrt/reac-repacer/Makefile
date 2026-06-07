@@ -19,7 +19,7 @@ define Package/reac-repacer
   CATEGORY:=Sound
   TITLE:=REAC Wi-Fi de-jitter re-pacer
   URL:=https://github.com/linuxnow/reac-aes67
-  DEPENDS:=+kmod-sched-core +tc-full +ip-full
+  DEPENDS:=+kmod-sched-core +tc-full +ip-full +libubus +libblobmsg-json
 endef
 
 define Package/reac-repacer/description
@@ -42,9 +42,13 @@ define Build/Prepare
 	$(CP) ./src/reac_repacer.c $(PKG_BUILD_DIR)/
 endef
 
+# -DHAVE_UBUS enables the live ubus control object (get stats / set hot params); without
+# it the daemon still builds + runs with SIGHUP-only live reconfig. On-device we link
+# libubus + libblobmsg_json (the get/set surface the LuCI depth slider drives).
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CFLAGS) -std=c11 -O2 -pthread \
-		-o $(PKG_BUILD_DIR)/reac-repacer $(PKG_BUILD_DIR)/reac_repacer.c
+	$(TARGET_CC) $(TARGET_CFLAGS) -std=c11 -O2 -pthread -DHAVE_UBUS \
+		-o $(PKG_BUILD_DIR)/reac-repacer $(PKG_BUILD_DIR)/reac_repacer.c \
+		-lubus -lblobmsg_json -lubox
 endef
 
 define Package/reac-repacer/install
@@ -54,6 +58,9 @@ define Package/reac-repacer/install
 	$(INSTALL_CONF) ./files/reac-repacer.config $(1)/etc/config/reac-repacer
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/reac-repacer.init $(1)/etc/init.d/reac-repacer
+	$(INSTALL_DIR) $(1)/usr/share/man/man8
+	gzip -9nc ./files/reac-repacer.8 > $(PKG_BUILD_DIR)/reac-repacer.8.gz
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/reac-repacer.8.gz $(1)/usr/share/man/man8/reac-repacer.8.gz
 endef
 
 $(eval $(call BuildPackage,reac-repacer))

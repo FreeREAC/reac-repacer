@@ -31,12 +31,37 @@
 //          --port reactap.13:lan3 [--prefill-ms 8] [--adapt] [--reclaim]
 //          [--no-auto-rate] [--period-ns N] [--cpu 3] [--prio 80]
 //          [--bcast-only] [--no-plc] [--ctrl-bypass] [--forward-only]
+//          [--no-steady] [--no-warm-start] [--lockfile PATH]
 //        (single port also accepts the legacy  --in IFACE --out IFACE  form.)
+//        --help/-h prints the full usage and exits. At least one --port is
+//        required: there is no implicit default, an unknown flag is rejected, and
+//        a missing port is an error (the daemon never launches with defaults).
+//
+// --steady (default on; --no-steady to disable): pace the output from a FREE-RUNNING
+//   clock at the base period, glacially rate-locked to the long-term input average via the
+//   PLL (sub-ppm, seconds-integrated). The per-tick drain servo is kept OFF the emit path so
+//   short-term WDS bursts are absorbed as occupancy swings and never reach the output cadence
+//   -- the cure for the "rubbery on silences" cadence jitter. Occupancy is a slow trim only.
+// --warm-start (default on; --no-warm-start to disable) + --lockfile PATH (default
+//   /etc/reac-repacer.lock): persist the converged per-port emit period and, on startup, seed
+//   the PLL from it so the daemon starts already-locked (no minutes-long audible convergence).
 //
 // --forward-only: de-jitter only the forward (IN->OUT) direction and do NOT run the
 //   return pass-through thread. Used on the MIXER side (IN=tunnel, OUT=mixer): the
 //   upstream box->master is de-jittered, while the downstream master->box is left on
 //   the kernel bridge (lossless) instead of a starvable user-space pass-through.
+//
+// Live reconfiguration (no restart, no dropout): the "hot" tuning params -- target
+// depth (prefill-ms / occupancy target), the adaptive window (min/max/margin) and the
+// servo clamp -- can be retuned on a running daemon. Two triggers share ONE apply path:
+//   ubus  reac_repacer set '{"prefill_ms":150}'   -- immediate, runtime-only, typed.
+//   SIGHUP                                         -- re-read /etc/config/reac-repacer
+//                                                     and apply the hot params (persists).
+// A target-depth change does NOT flush/refill the ring: the occupancy is walked to the
+// new target by a small, bounded clock bias held for a few hundred ms (grow = hold the
+// output back, shrink = run it ahead), so audio stays continuous and only the latency
+// walks to the new value. Structural params (the port/interface mapping) stay
+// restart-only -- a live change there is rejected, not silently ignored.
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -49,6 +74,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -57,6 +83,11 @@
 #include <netinet/in.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+
+#ifdef HAVE_UBUS
+#include <libubus.h>
+#include <libubox/blobmsg.h>
+#endif
 
 #ifndef PACKET_QDISC_BYPASS
 #define PACKET_QDISC_BYPASS 20
@@ -74,6 +105,18 @@
 #define SERVO_KI       0.02  /* integral gain -- nulls the residual rate offset (rate-match) */
 
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t got_hup = 0;   /* SIGHUP -> re-read UCI + apply hot params (set in the
+                                             * handler only; the main loop does the work, so the
+                                             * handler stays async-signal-safe) */
+
+/* Live-reconfig request. A trigger (ubus set / SIGHUP) writes the new HOT params here
+ * and bumps reconf_gen; the pacing loop notices the bump, clamps + applies them through
+ * the one shared apply path (the glitch-free occupancy retarget for a depth change), and
+ * publishes the applied values back for the ubus get reply. Plain ints written/read
+ * word-atomically; reconf_gen is the single fence the loop polls. */
+struct hot_params { int prefill_ms, adapt_min_ms, adapt_max_ms, adapt_margin, servo_clamp_ppm; };
+static struct hot_params g_pending;                  /* staged by a trigger */
+static volatile sig_atomic_t reconf_gen = 0;         /* bumped on each staged request */
 
 /* global config (identical for every port) */
 static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
@@ -103,6 +146,37 @@ static int g_pll;                   /* glacial frequency-lock: converge BASE per
 static double g_pll_fgain = PLL_FGAIN;   /* runtime override (--pll-fgain) */
 static double g_pll_pgain = PLL_PGAIN;   /* runtime override (--pll-pgain); 0 = pure frequency-lock, no recenter */
 static int    g_pll_pos_min = 0;         /* position-control source: 0=mean depth (default), 1=tightest port (--pll-pos-min) */
+
+/* STEADY free-running output clock (the primary audio-quality fix, design §3 + §3b).
+ * The output cadence is the audio: the stagebox recovers its word clock from the emit
+ * inter-frame interval, so any per-tick rate nudge IS audible jitter ("rubbery on
+ * silences"). On-rig the fast drain servo's per-tick bias leaked WDS input jitter into
+ * the output cadence. With --steady the emit period FREE-RUNS at the base period and is
+ * NOT modulated per-tick or per-occupancy-swing: short-term WDS bursts are absorbed as
+ * occupancy swings (ring depth) and never reach the cadence. Occupancy is used ONLY as a
+ * GLACIAL trim -- the PLL, integrated over PLL_WIN ticks (seconds), nudges the base period
+ * sub-ppm to null the long-term rate error. The fast servo is held off the emit path (its
+ * bias is forced to 0) so it cannot chatter the cadence. PLC still fires on a TRUE empty,
+ * and the operator-commanded retarget walk (live-reconfig depth change) is untouched -- it
+ * is a separate, intentional, bounded latency move, not steady-state occupancy chasing. */
+static int g_steady = 1;             /* default ON in v2 (--no-steady restores v1's servo-paced cadence) */
+
+/* PLL warm-start: a glacial lock takes minutes to converge, and a cold start spends those
+ * minutes audibly converging. Once converged we persist the locked emit period (ns) PER PORT
+ * to a small state file; on startup we seed the base period from it so the daemon starts
+ * already-locked (instant clean), then slow-tracks for long-term drift. Per port because each
+ * router's crystal offset differs (reac1 ~124867 ns, reac2 ~124929 ns for the same 96k master).
+ * A missing/invalid file is tolerated -- the daemon cold-starts exactly as before.
+ *
+ * Format (line-oriented text, one record per output port, '#'-comments + blanks ignored):
+ *   <out_iface> <emit_period_ns> <rate_label_hz> <unix_epoch_saved>
+ * e.g.  lan1 124867 96000 1749150000
+ * The out_iface is the key (a router handles a fixed set of stagebox-side ports); the daemon
+ * restores only the periods for the ports it is configured with, and only when the saved
+ * rate label matches the rate it detected at startup (a 44.1<->48<->96 k change invalidates it). */
+static const char *g_lockfile = "/etc/reac-repacer.lock";
+static int   g_warm_start = 1;       /* default ON (--no-warm-start disables persist + restore) */
+#define LOCK_SAVE_WIN  240000        /* persist the converged lock ~every 30 s @ 8000 fps */
 
 struct iface { int fd; int ifindex; struct sockaddr_ll tx; };
 
@@ -141,6 +215,7 @@ static struct stream streams[MAX_STREAMS];
 static int n_streams;
 
 static void on_sig(int s) { (void)s; running = 0; }
+static void on_hup(int s) { (void)s; got_hup = 1; }   /* defer the work to the main loop */
 
 static long long ns_now(void) {
 	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -227,6 +302,79 @@ static long nearest_std_pps(double pps) {
 	long best = t[0]; double bd = 1e18;
 	for (unsigned i = 0; i < 3; i++) { double d = pps - (double)t[i]; if (d < 0) d = -d; if (d < bd) { bd = d; best = t[i]; } }
 	return best;
+}
+
+/* sample rate (Hz) a frame rate (pps) belongs to: 12 samples per REAC frame */
+static long rate_label_hz(long period_ns) {
+	if (period_ns < 1) return 0;
+	double pps = 1.0e9 / (double)period_ns;
+	return nearest_std_pps(pps) * 12;
+}
+
+/* ---- PLL warm-start: persist + restore the converged per-port emit period ---------
+ *
+ * lock_load: look up the saved emit period (ns) for out_name, returning it (or 0 if
+ *   absent/invalid) so the caller can seed the PLL already-locked. Only accepts a record
+ *   whose saved rate label matches rate_hz (a 44.1/48/96 k change since the save voids it)
+ *   and whose period is within a sane +/-5% of the standard for that rate. */
+static long lock_load(const char *out_name, long rate_hz) {
+	if (!g_warm_start) return 0;
+	FILE *f = fopen(g_lockfile, "r");
+	if (!f) return 0;
+	char line[160]; long found = 0;
+	while (fgets(line, sizeof line, f)) {
+		char *p = line; while (*p == ' ' || *p == '\t') p++;
+		if (*p == '#' || *p == '\n' || *p == '\0') continue;
+		char nm[IFNAMSIZ]; long per = 0, lab = 0; long long ts = 0;
+		if (sscanf(p, "%15s %ld %ld %lld", nm, &per, &lab, &ts) < 3) continue;
+		if (strcmp(nm, out_name)) continue;
+		if (lab != rate_hz) continue;                                  /* rate changed -> stale */
+		long std_per = (long)(1.0e9 / (double)(nearest_std_pps(1.0e9 / (double)per)) + 0.5);
+		if (per < std_per - std_per / 20 || per > std_per + std_per / 20) continue;  /* +/-5% sanity */
+		found = per;            /* last matching record wins (newest appended) */
+	}
+	fclose(f);
+	return found;
+}
+
+/* lock_save: rewrite the state file with the live converged period for every active port,
+ * preserving entries for ports this daemon does NOT handle (a different router/instance may
+ * own them). Written to a temp file + rename so a crash never leaves a half-written lock.
+ * period_ns is the daemon's single shared base period; each active port's crystal offset is
+ * already folded into it (one daemon == one router == one recovered clock), so every active
+ * port of this daemon records the same value -- the per-port keying lets a DIFFERENT router's
+ * daemon restore its own ports' (differently-offset) periods from the same shared file. */
+static void lock_save(long period_ns) {
+	if (!g_warm_start) return;
+	long rate_hz = rate_label_hz(period_ns);
+	char tmp[256]; snprintf(tmp, sizeof tmp, "%s.tmp", g_lockfile);
+	FILE *out = fopen(tmp, "w");
+	if (!out) return;
+	fprintf(out, "# reac-repacer PLL warm-start lock -- per-port converged emit period.\n");
+	fprintf(out, "# <out_iface> <emit_period_ns> <rate_label_hz> <unix_epoch_saved>\n");
+	long long now = (long long)time(NULL);
+	/* carry over records for ports we do not own (untouched lines), skipping ones we rewrite */
+	FILE *in = fopen(g_lockfile, "r");
+	if (in) {
+		char line[160];
+		while (fgets(line, sizeof line, in)) {
+			char *p = line; while (*p == ' ' || *p == '\t') p++;
+			if (*p == '#' || *p == '\n' || *p == '\0') continue;
+			char nm[IFNAMSIZ];
+			if (sscanf(p, "%15s", nm) != 1) continue;
+			int ours = 0;
+			for (int i = 0; i < n_streams; i++) if (!strcmp(streams[i].out_name, nm)) { ours = 1; break; }
+			if (ours) continue;                       /* will be re-emitted fresh below */
+			fputs(line, out);
+		}
+		fclose(in);
+	}
+	for (int i = 0; i < n_streams; i++) {
+		if (streams[i].n_rx == 0 || !streams[i].started) continue;   /* only ports actually locked */
+		fprintf(out, "%s %ld %ld %lld\n", streams[i].out_name, period_ns, rate_hz, now);
+	}
+	fclose(out);
+	rename(tmp, g_lockfile);                           /* atomic publish */
 }
 
 /* recompute the per-port window sizes that depend on the slot period */
@@ -330,7 +478,330 @@ static int add_stream(const char *in, const char *out) {
 	return 0;
 }
 
+/* ---- live reconfiguration (no-restart retune, no dropout) -------------------------
+ *
+ * The pacing loop owns its tuning state on its stack. pacer_live points at the pieces a
+ * live retune touches so the ubus set / SIGHUP path can adjust them from inside the loop
+ * (both triggers are serviced ON the pacing thread, so there is no cross-thread race --
+ * the ubus socket is drained by ubus_handle_event from the loop, and SIGHUP only sets a
+ * flag the loop reads). prefill_ms is the live target depth in ms; the loop keeps the
+ * frame-count target (prefill / shtgt) derived from it and the current period. */
+struct pacer_live {
+	int    prefill_ms;            /* live target depth (ms) -- the source of the occupancy target */
+	long   period_ns;            /* current base period (the frozen recovered clock) */
+	int   *prefill;              /* loop's target occupancy (frames), kept == prefill_ms @ period */
+	double *shtgt;               /* shared adaptive target (frames) the servo/PLL steer toward */
+	int   *t_floor, *t_ceil;     /* adapt clamps (frames) derived from adapt_min/max_ms */
+	double *max_ppm;             /* servo clamp (ppm) derived from g_servo_clamp_ppm */
+	double *retarget_ppm;        /* extra clock bias held during a depth ramp (+ = drain/shrink) */
+	int    *retarget_ticks;      /* ticks remaining in the current depth ramp */
+};
+
+/* clamp the staged hot params to the same ranges the CLI/UCI accept, in place */
+static void hot_params_clamp(struct hot_params *p) {
+	if (p->prefill_ms < 1)    p->prefill_ms = 1;
+	if (p->prefill_ms > 1000) p->prefill_ms = 1000;       /* bounded by the ring (clamped again to occ_cap below) */
+	if (p->adapt_min_ms < 1)  p->adapt_min_ms = 1;
+	if (p->adapt_max_ms < p->adapt_min_ms) p->adapt_max_ms = p->adapt_min_ms;
+	if (p->adapt_max_ms > 1000) p->adapt_max_ms = 1000;
+	if (p->adapt_margin < 0)  p->adapt_margin = 0;
+	if (p->adapt_margin > RING_SZ - 64) p->adapt_margin = RING_SZ - 64;
+	if (p->servo_clamp_ppm < 0) p->servo_clamp_ppm = 0;
+	if (p->servo_clamp_ppm > 50000) p->servo_clamp_ppm = 50000;
+}
+
+/* The glitch-free occupancy retarget + hot-param apply. Called from the pacing loop when
+ * a retune was staged. Updates the global hot params (g_adapt_*, g_servo_clamp_ppm) and
+ * the loop's derived state, and -- on a target-depth change -- schedules a gentle ramp
+ * that walks the LIVE occupancy to the new target by biasing the clock for a short while.
+ * NO frame is dropped and the ring is NOT flushed: audio stays continuous and only the
+ * latency walks to the new value. Grow = hold output back (negative bias = slower clock),
+ * shrink = run output ahead (positive bias = faster clock).
+ *
+ * Physics: moving the latency by N frames means the output emits N more/fewer frames than
+ * it consumes over the walk, i.e. a rate offset of N/walk_frames. A small by-ear nudge (a
+ * few ms) glides in the nominal RETARGET_MS at a sub-cent, inaudible rate; a large jump is
+ * held at RETARGET_MAXPPM (a transient sub-4-cent glide -- well inside the band the servo
+ * already treats as inaudible) and the walk simply takes longer, since latency cannot be
+ * shifted by X ms in much less than X ms of wall time without an audible pitch step. */
+#define RETARGET_MS     400.0    /* nominal walk time for a small depth nudge */
+#define RETARGET_MAXPPM 2000.0   /* bias ceiling for the walk (~3.5 cents, transient): a
+                                  * larger jump stretches the duration rather than exceed it,
+                                  * keeping the glide inaudible */
+static void apply_hot_params(struct pacer_live *L, const struct hot_params *in) {
+	struct hot_params p = *in;
+	hot_params_clamp(&p);
+
+	/* the non-depth hot params take effect immediately via their globals + derived locals */
+	g_adapt_min_ms    = p.adapt_min_ms;
+	g_adapt_max_ms    = p.adapt_max_ms;
+	g_adapt_margin    = p.adapt_margin;
+	g_servo_clamp_ppm = p.servo_clamp_ppm;
+	*L->t_floor = (int)((long long)g_adapt_min_ms * 1000000 / L->period_ns); if (*L->t_floor < 4) *L->t_floor = 4;
+	*L->t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / L->period_ns); if (*L->t_ceil > RING_SZ - 64) *L->t_ceil = RING_SZ - 64;
+	*L->max_ppm = (double)g_servo_clamp_ppm;
+
+	/* target depth: convert ms -> frames at the live period, clamp into the ring */
+	int new_pf = (int)((long long)p.prefill_ms * 1000000 / L->period_ns);
+	if (new_pf < 1) new_pf = 1;
+	if (new_pf > RING_SZ - 65) new_pf = RING_SZ - 65;
+	if (n_streams > 0 && new_pf > streams[0].occ_cap - 1) new_pf = streams[0].occ_cap - 1;
+	int old_pf = *L->prefill;
+	L->prefill_ms = p.prefill_ms;
+	*L->prefill = new_pf;
+	*L->shtgt   = (double)new_pf;          /* the servo/PLL now steer toward the new depth */
+	for (int i = 0; i < n_streams; i++) streams[i].target = new_pf;
+
+	/* schedule the glitch-free walk only if the depth actually moved. Each biased tick moves
+	 * occupancy by ppm*1e-6 slots (output runs ahead at +ppm = drain), so walking |delta|
+	 * slots over N ticks needs ppm = -delta*1e6/N (grow=hold back=neg, shrink=ahead=pos). Aim
+	 * for a RETARGET_MS walk; if that would exceed RETARGET_MAXPPM, hold the bias at the cap
+	 * and stretch N so each step stays inaudible. */
+	int delta = new_pf - old_pf;           /* >0 grow (more latency), <0 shrink */
+	if (delta != 0) {
+		double fps = 1.0e9 / (double)L->period_ns;
+		double ticks = RETARGET_MS * 1.0e-3 * fps; if (ticks < 1.0) ticks = 1.0;
+		double ppm = -(double)delta * 1.0e6 / ticks;   /* -delta: grow=hold back(neg), shrink=ahead(pos) */
+		if (ppm > RETARGET_MAXPPM || ppm < -RETARGET_MAXPPM) {
+			double cap = RETARGET_MAXPPM;
+			ticks = (double)(delta < 0 ? -delta : delta) * 1.0e6 / cap;   /* stretch to honour the cap */
+			ppm = (delta > 0) ? -cap : cap;
+		}
+		*L->retarget_ppm   = ppm;
+		*L->retarget_ticks = (int)(ticks + 0.5);
+	} else {
+		*L->retarget_ppm = 0.0; *L->retarget_ticks = 0;
+	}
+	fprintf(stderr, "reconfig: prefill=%dms(%d->%d slots) adapt=%d-%dms margin=%d servo-clamp=%dppm%s\n",
+	        L->prefill_ms, old_pf, new_pf, g_adapt_min_ms, g_adapt_max_ms, g_adapt_margin, g_servo_clamp_ppm,
+	        delta ? " [occupancy walk armed]" : "");
+}
+
+/* SIGHUP path: re-read the HOT params from /etc/config/reac-repacer via the uci CLI
+ * (always present under procd; avoids linking libuci) and stage them. Anything absent
+ * keeps the running value (passed in via cur). Done from the main loop, never the
+ * handler. */
+static int uci_get_int(const char *opt, int cur) {
+	char cmd[160]; snprintf(cmd, sizeof cmd, "uci -q get reac-repacer.main.%s", opt);
+	FILE *f = popen(cmd, "r");
+	if (!f) return cur;
+	char buf[64]; int v = cur;
+	if (fgets(buf, sizeof buf, f)) { char *e; long n = strtol(buf, &e, 10); if (e != buf) v = (int)n; }
+	pclose(f);
+	return v;
+}
+static void reload_hot_params_from_uci(struct pacer_live *L) {
+	struct hot_params p = {
+		.prefill_ms      = uci_get_int("prefill_ms",      L->prefill_ms),
+		.adapt_min_ms    = uci_get_int("adapt_min_ms",    g_adapt_min_ms),
+		.adapt_max_ms    = uci_get_int("adapt_max_ms",    g_adapt_max_ms),
+		.adapt_margin    = uci_get_int("adapt_margin",    g_adapt_margin),
+		.servo_clamp_ppm = uci_get_int("servo_clamp_ppm", g_servo_clamp_ppm),
+	};
+	apply_hot_params(L, &p);
+}
+
+#ifdef HAVE_UBUS
+/* ubus object "reac_repacer": get (live stats snapshot) + set (stage a hot retune). Both
+ * callbacks run on the pacing thread (the loop drains the ubus socket itself), so set can
+ * stage straight into g_pending and bump reconf_gen for the loop to apply on the next tick. */
+static struct ubus_context *g_ubus_ctx;
+static struct blob_buf g_ubus_b;
+static struct pacer_live *g_live;         /* the loop publishes its address for get's snapshot */
+
+enum { SET_PREFILL_MS, SET_ADAPT_MIN_MS, SET_ADAPT_MAX_MS, SET_ADAPT_MARGIN, SET_SERVO_CLAMP_PPM, __SET_MAX };
+static const struct blobmsg_policy set_policy[__SET_MAX] = {
+	[SET_PREFILL_MS]      = { .name = "prefill_ms",      .type = BLOBMSG_TYPE_INT32 },
+	[SET_ADAPT_MIN_MS]    = { .name = "adapt_min_ms",    .type = BLOBMSG_TYPE_INT32 },
+	[SET_ADAPT_MAX_MS]    = { .name = "adapt_max_ms",    .type = BLOBMSG_TYPE_INT32 },
+	[SET_ADAPT_MARGIN]    = { .name = "adapt_margin",    .type = BLOBMSG_TYPE_INT32 },
+	[SET_SERVO_CLAMP_PPM] = { .name = "servo_clamp_ppm", .type = BLOBMSG_TYPE_INT32 },
+	/* a port/interface key here is structural -> rejected (see set_cb) */
+};
+
+static int repacer_get_cb(struct ubus_context *ctx, struct ubus_object *obj,
+                          struct ubus_request_data *req, const char *method,
+                          struct blob_attr *msg) {
+	(void)obj; (void)method; (void)msg;
+	blob_buf_init(&g_ubus_b, 0);
+	blobmsg_add_u8(&g_ubus_b, "running", 1);
+	if (g_live) {
+		blobmsg_add_u32(&g_ubus_b, "prefill_ms", (uint32_t)g_live->prefill_ms);
+		blobmsg_add_u32(&g_ubus_b, "target_slots", (uint32_t)*g_live->prefill);
+		blobmsg_add_u32(&g_ubus_b, "period_ns", (uint32_t)g_live->period_ns);
+		blobmsg_add_u32(&g_ubus_b, "retarget_active", (uint32_t)(*g_live->retarget_ticks > 0));
+	}
+	blobmsg_add_u32(&g_ubus_b, "adapt_min_ms", (uint32_t)g_adapt_min_ms);
+	blobmsg_add_u32(&g_ubus_b, "adapt_max_ms", (uint32_t)g_adapt_max_ms);
+	blobmsg_add_u32(&g_ubus_b, "adapt_margin", (uint32_t)g_adapt_margin);
+	blobmsg_add_u32(&g_ubus_b, "servo_clamp_ppm", (uint32_t)g_servo_clamp_ppm);
+	blobmsg_add_u8(&g_ubus_b, "adapt", g_adapt ? 1 : 0);
+	blobmsg_add_u8(&g_ubus_b, "pll", g_pll ? 1 : 0);
+	blobmsg_add_u32(&g_ubus_b, "ports", (uint32_t)n_streams);
+	long pn = g_live ? g_live->period_ns : 1;   /* g_live is set before the object is registered */
+	void *a = blobmsg_open_array(&g_ubus_b, "port");
+	for (int i = 0; i < n_streams; i++) {
+		struct stream *s = &streams[i];
+		unsigned head = s->r_head, tail = __atomic_load_n(&s->r_tail, __ATOMIC_ACQUIRE);
+		int occ = (int)((tail - head) & RING_MASK);
+		void *t = blobmsg_open_table(&g_ubus_b, NULL);
+		blobmsg_add_string(&g_ubus_b, "in", s->in_name);
+		blobmsg_add_string(&g_ubus_b, "out", s->out_name);
+		blobmsg_add_u8(&g_ubus_b, "started", s->started ? 1 : 0);
+		blobmsg_add_u32(&g_ubus_b, "occ", (uint32_t)occ);
+		blobmsg_add_u32(&g_ubus_b, "occ_ms", (uint32_t)((long long)occ * pn / 1000000));
+		blobmsg_add_u64(&g_ubus_b, "rx", s->n_rx);
+		blobmsg_add_u64(&g_ubus_b, "tx", s->n_tx);
+		blobmsg_add_u64(&g_ubus_b, "underrun", s->n_underrun);
+		blobmsg_add_u64(&g_ubus_b, "plc", s->n_plc);
+		blobmsg_close_table(&g_ubus_b, t);
+	}
+	blobmsg_close_array(&g_ubus_b, a);
+	ubus_send_reply(ctx, req, g_ubus_b.head);
+	return 0;
+}
+
+static int repacer_set_cb(struct ubus_context *ctx, struct ubus_object *obj,
+                          struct ubus_request_data *req, const char *method,
+                          struct blob_attr *msg) {
+	(void)ctx; (void)obj; (void)method;
+	/* reject structural keys outright: changing the port/interface mapping needs socket
+	 * re-setup and a re-lock, which cannot be done live without a dropout. */
+	struct blob_attr *cur; size_t rem;
+	blobmsg_for_each_attr(cur, msg, rem) {
+		const char *k = blobmsg_name(cur);
+		if (!strcmp(k, "port") || !strcmp(k, "in_iface") || !strcmp(k, "out_iface") ||
+		    !strcmp(k, "in") || !strcmp(k, "out") || !strcmp(k, "cpu"))
+			return UBUS_STATUS_NOT_SUPPORTED;   /* structural / restart-only */
+	}
+	struct blob_attr *tb[__SET_MAX];
+	blobmsg_parse(set_policy, __SET_MAX, tb, blob_data(msg), blob_len(msg));
+
+	/* seed from the running values so an omitted key is left unchanged */
+	struct hot_params p = {
+		.prefill_ms      = g_live ? g_live->prefill_ms : 0,
+		.adapt_min_ms    = g_adapt_min_ms,
+		.adapt_max_ms    = g_adapt_max_ms,
+		.adapt_margin    = g_adapt_margin,
+		.servo_clamp_ppm = g_servo_clamp_ppm,
+	};
+	if (tb[SET_PREFILL_MS])      p.prefill_ms      = blobmsg_get_u32(tb[SET_PREFILL_MS]);
+	if (tb[SET_ADAPT_MIN_MS])    p.adapt_min_ms    = blobmsg_get_u32(tb[SET_ADAPT_MIN_MS]);
+	if (tb[SET_ADAPT_MAX_MS])    p.adapt_max_ms    = blobmsg_get_u32(tb[SET_ADAPT_MAX_MS]);
+	if (tb[SET_ADAPT_MARGIN])    p.adapt_margin    = blobmsg_get_u32(tb[SET_ADAPT_MARGIN]);
+	if (tb[SET_SERVO_CLAMP_PPM]) p.servo_clamp_ppm = blobmsg_get_u32(tb[SET_SERVO_CLAMP_PPM]);
+
+	hot_params_clamp(&p);          /* validate ranges before staging */
+	g_pending = p;
+	reconf_gen++;                  /* the loop applies it on the next tick */
+
+	/* reflect the (clamped) values that will be applied */
+	blob_buf_init(&g_ubus_b, 0);
+	blobmsg_add_u32(&g_ubus_b, "prefill_ms", (uint32_t)p.prefill_ms);
+	blobmsg_add_u32(&g_ubus_b, "adapt_min_ms", (uint32_t)p.adapt_min_ms);
+	blobmsg_add_u32(&g_ubus_b, "adapt_max_ms", (uint32_t)p.adapt_max_ms);
+	blobmsg_add_u32(&g_ubus_b, "adapt_margin", (uint32_t)p.adapt_margin);
+	blobmsg_add_u32(&g_ubus_b, "servo_clamp_ppm", (uint32_t)p.servo_clamp_ppm);
+	ubus_send_reply(ctx, req, g_ubus_b.head);
+	return 0;
+}
+
+static struct ubus_method repacer_methods[] = {
+	UBUS_METHOD_NOARG("get", repacer_get_cb),
+	UBUS_METHOD("set", repacer_set_cb, set_policy),
+};
+static struct ubus_object_type repacer_obj_type =
+	UBUS_OBJECT_TYPE("reac_repacer", repacer_methods);
+static struct ubus_object repacer_obj = {
+	.name = "reac_repacer",
+	.type = &repacer_obj_type,
+	.methods = repacer_methods,
+	.n_methods = ARRAY_SIZE(repacer_methods),
+};
+
+/* connect + register. Returns the socket fd to poll from the loop, or -1 if ubus is
+ * unavailable (the daemon then runs without the live ubus control surface). */
+static int ubus_setup(struct pacer_live *L) {
+	g_live = L;
+	g_ubus_ctx = ubus_connect(NULL);
+	if (!g_ubus_ctx) { fprintf(stderr, "ubus: connect failed; live ubus control disabled\n"); return -1; }
+	if (ubus_add_object(g_ubus_ctx, &repacer_obj) != 0) {
+		fprintf(stderr, "ubus: add_object failed; live ubus control disabled\n");
+		ubus_free(g_ubus_ctx); g_ubus_ctx = NULL; return -1;
+	}
+	return g_ubus_ctx->sock.fd;
+}
+/* drain any pending ubus request without blocking (called from the pacing loop) */
+static void ubus_service(int fd) {
+	if (!g_ubus_ctx) return;
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
+	if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN)) ubus_handle_event(g_ubus_ctx);
+}
+#else
+/* no libubus: live control is SIGHUP-only; the get/set surface is absent */
+static int  ubus_setup(struct pacer_live *L) { (void)L; return -1; }
+static void ubus_service(int fd) { (void)fd; }
+#endif
+
+/* Print the full usage to the given stream. Listed defaults track the globals + the
+ * main() locals below; every flag the parse loop understands appears here. */
+static void usage(FILE *f) {
+	fprintf(f,
+"reac_repacer -- de-jitter / re-pacing relay for a Roland REAC stream over Wi-Fi/WDS.\n"
+"\n"
+"Buffers the bursty master broadcast and re-emits a constant cadence on a steady,\n"
+"free-running clock to the local stagebox, so a clock-slave stagebox stays locked\n"
+"across a jittery wireless path. One daemon handles one or more REAC ports.\n"
+"\n"
+"Usage: reac_repacer --port IN:OUT [--port IN:OUT ...] [options]\n"
+"\n"
+"At least one --port is required (there is no implicit default).\n"
+"\n"
+"Ports:\n"
+"  --port IN:OUT          REAC port as an IN:OUT interface pair; repeat for each\n"
+"                         port (IN = tunnel side, OUT = stagebox side). Required.\n"
+"\n"
+"Pacing / clock:\n"
+"  --prefill-ms N         target buffer depth in ms before emitting (default 12)\n"
+"  --servo-clamp-ppm N    drain-servo clock-bias clamp in ppm (default 700)\n"
+"  --pll                  glacial frequency-lock: converge the base period to null\n"
+"                         the long-term occupancy drift (default off)\n"
+"  --no-steady            disable the steady free-running output clock and restore\n"
+"                         the per-tick servo-paced cadence (steady is on by default)\n"
+"\n"
+"Adaptive window:\n"
+"  --adapt                auto-size the buffer to the observed burst depth (default off)\n"
+"  --adapt-min-ms N       floor latency in ms when shrinking (default 6)\n"
+"  --adapt-max-ms N       ceiling latency in ms when growing (default 120)\n"
+"  --adapt-margin N       keep the occupancy low-water mark this many slots above 0\n"
+"                         (default 20)\n"
+"  --reclaim              actively shrink latency (may drop frames -> clicks); the\n"
+"                         default is grow-only (default off)\n"
+"\n"
+"Topology / placement:\n"
+"  --forward-only         de-jitter only the forward (IN->OUT) direction and do not\n"
+"                         run the return pass-through (mixer side; default off)\n"
+"  --bcast-only           accept only the master broadcast frames (default off)\n"
+"  --cpu N                core to pin the real-time pacing thread to (default 3)\n"
+"\n"
+"Warm-start state:\n"
+"  --no-warm-start        do not persist or restore the converged lock (warm-start\n"
+"                         is on by default)\n"
+"  --lockfile PATH        warm-start state file (default /etc/reac-repacer.lock)\n"
+"\n"
+"  -h, --help             show this help and exit\n"
+"\n"
+"Examples:\n"
+"  reac_repacer --port reactap.11:lan1 --port reactap.12:lan2 --prefill-ms 16\n"
+"  reac_repacer --port reactap.11:lan1 --forward-only --adapt\n");
+}
+
 int main(int argc, char **argv) {
+	/* --help/-h is handled before ANYTHING else (no rate detect, no socket bind, no port
+	 * setup): print usage to stdout and exit 0 without starting the daemon. */
+	for (int i = 1; i < argc; i++)
+		if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+
 	const char *pend_in = NULL, *pend_out = NULL;
 	int prefill_ms = 12, cpu = 3, prio = 80; long period_ns = 250000;
 	for (int i = 1; i < argc; i++) {
@@ -361,16 +832,36 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--pll-fgain") && i + 1 < argc) g_pll_fgain = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--pll-pgain") && i + 1 < argc) g_pll_pgain = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--pll-pos-min")) g_pll_pos_min = 1;
+		else if (!strcmp(argv[i], "--steady")) g_steady = 1;
+		else if (!strcmp(argv[i], "--no-steady")) g_steady = 0;
+		else if (!strcmp(argv[i], "--warm-start")) g_warm_start = 1;
+		else if (!strcmp(argv[i], "--no-warm-start")) g_warm_start = 0;
+		else if (!strcmp(argv[i], "--lockfile") && i + 1 < argc) g_lockfile = argv[++i];
 		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
+		else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+		else {
+			/* unknown flag (or a value-taking flag missing its argument): error to stderr,
+			 * show usage, and exit 1 -- never silently ignore it and launch with defaults. */
+			fprintf(stderr, "reac_repacer: unknown or malformed option '%s'\n\n", argv[i]);
+			usage(stderr);
+			return 1;
+		}
 	}
 	if (pend_in && pend_out) add_stream(pend_in, pend_out);   /* legacy single-port form */
-	if (n_streams == 0) add_stream("reactap.11", "lan1");     /* default */
+	/* No implicit default: launching with no port (bare, or only non-port flags) was a
+	 * footgun -- it silently started a pacer on reactap.11:lan1. Require an explicit port. */
+	if (n_streams == 0) {
+		fprintf(stderr, "reac_repacer: no port given -- pass at least one --port IN:OUT\n\n");
+		usage(stderr);
+		return 1;
+	}
 
 	int prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 	if (prefill < 1) prefill = 1;
 	if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
 
 	signal(SIGINT, on_sig); signal(SIGTERM, on_sig);
+	signal(SIGHUP, on_hup);    /* live re-read of the UCI hot params (applied in the loop) */
 
 	/* allocate + open every port */
 	for (int i = 0; i < n_streams; i++) {
@@ -445,8 +936,8 @@ int main(int argc, char **argv) {
 			__atomic_store_n(&streams[i].r_head, __atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 	}
 
-	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d fwd_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d\n",
-	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_forward_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim);
+	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d fwd_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d steady=%d warm=%d\n",
+	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_forward_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim, g_steady, g_warm_start);
 	for (int i = 0; i < n_streams; i++)
 		fprintf(stderr, "  port %d: %s -> %s\n", i, streams[i].in_name, streams[i].out_name);
 
@@ -512,6 +1003,24 @@ int main(int argc, char **argv) {
 			if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;
 			for (int i = 0; i < n_streams; i++) stream_resize(&streams[i], period_ns, prefill);
 		}
+		/* PLL warm-start: if a converged lock for one of our ports was persisted at this same
+		 * sample rate, seed the base period from it so the daemon starts ALREADY LOCKED instead
+		 * of spending minutes audibly converging. The saved value already carries this router's
+		 * crystal offset (per-port keyed); the PLL then slow-tracks it for long-term drift. */
+		if (g_auto_rate && g_warm_start && matched_pps > 100.0) {
+			long rate_hz = rate_label_hz(period_ns);
+			long warm = 0;
+			for (int i = 0; i < n_streams && !warm; i++) warm = lock_load(streams[i].out_name, rate_hz);
+			if (warm > 0) {
+				period_ns = warm;
+				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
+				if (prefill < 1) prefill = 1;
+				if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;
+				for (int i = 0; i < n_streams; i++) stream_resize(&streams[i], period_ns, prefill);
+				fprintf(stderr, "warm-start: restored converged period=%ld ns (%ld Hz) from %s\n",
+				        period_ns, rate_hz, g_lockfile);
+			}
+		}
 		fprintf(stderr, "repacer: ingest settled in %d s, rate=%.1f pps, period=%ld ns -> filling\n",
 		        settle_iter, matched_pps, period_ns);
 	}
@@ -562,6 +1071,7 @@ int main(int argc, char **argv) {
 	int servo_div = 0;
 	int drift_div = 0; double drift_prev = 1e9;   /* base tracker: null long-term occ-vs-target drift */
 	int pll_div = 0; double pll_ref = -1.0;        /* glacial PLL: converge base period to null occ drift */
+	int lock_div = 0;                              /* warm-start: persist the converged lock periodically */
 	/* ONE shared target for all ports (they share a clock + a source). Sized to the worst
 	 * low-water dip across ports + margin: grow at once to cover a burst, ease down ~1 slot/4s
 	 * when calm. The servo then steers the tightest port's smoothed occupancy onto it. */
@@ -570,6 +1080,22 @@ int main(int argc, char **argv) {
 	int t_floor = (int)((long long)g_adapt_min_ms * 1000000 / period_ns); if (t_floor < 4) t_floor = 4;
 	int t_ceil  = (int)((long long)g_adapt_max_ms * 1000000 / period_ns); if (t_ceil > RING_SZ - 64) t_ceil = RING_SZ - 64;
 	int rate_chg = 0;
+
+	/* glitch-free occupancy retarget state: while retarget_ticks>0 the period carries an
+	 * extra retarget_ppm bias that walks the live occupancy to a newly-set depth (no flush,
+	 * no drop). Set by apply_hot_params; consumed + decremented in the tick below. */
+	double retarget_ppm = 0.0; int retarget_ticks = 0;
+
+	/* expose the loop's tuning state to the live-reconfig path (ubus set / SIGHUP); both run
+	 * on this thread, so they mutate it directly through these pointers. prefill_ms tracks the
+	 * live target depth so get reports it and a fresh set can compute its delta. */
+	struct pacer_live live = {
+		.prefill_ms = prefill_ms, .period_ns = period_ns,
+		.prefill = &prefill, .shtgt = &shtgt, .t_floor = &t_floor, .t_ceil = &t_ceil,
+		.max_ppm = &max_ppm, .retarget_ppm = &retarget_ppm, .retarget_ticks = &retarget_ticks,
+	};
+	int ubus_fd = ubus_setup(&live);
+	int applied_gen = reconf_gen;
 
 	while (running) {
 		struct timespec d = { deadline / 1000000000LL, deadline % 1000000000LL };
@@ -583,6 +1109,14 @@ int main(int argc, char **argv) {
 			int active = 0;
 			pace_one(&streams[i], &active, eq_floor, eq_done, join_depth);
 		}
+
+		/* service the two live-reconfig triggers AFTER the emit (the emit is the jitter-critical
+		 * part; the apply takes effect from the next tick). ubus set stages into g_pending + bumps
+		 * reconf_gen; SIGHUP re-reads UCI here (async-safe -- the handler only set a flag). Both
+		 * funnel through apply_hot_params -> the shared glitch-free retarget. */
+		ubus_service(ubus_fd);
+		if (got_hup) { got_hup = 0; reload_hot_params_from_uci(&live); applied_gen = reconf_gen; }
+		if (reconf_gen != applied_gen) { applied_gen = reconf_gen; apply_hot_params(&live, &g_pending); }
 		/* latch the occupancy-anchored start once every initially-active port has begun. ONE-TIME;
 		 * only re-armed on a rate-change relock. This also un-freezes the PLL below. */
 		if (!eq_done) {
@@ -624,8 +1158,12 @@ int main(int argc, char **argv) {
 			for (int i = 0; i < n_streams; i++) { streams[i].occ_min_win = 1 << 30; streams[i].target = (int)shtgt; }
 			adapt_div = 0;
 		}
-		/* drain servo (~every 16 ms): steer the tightest port's occupancy onto the shared target */
-		if (have && ++servo_div >= 64) {
+		/* drain servo (~every 16 ms): steer the tightest port's occupancy onto the shared target.
+		 * STEADY MODE keeps this OFF the emit path entirely -- a per-tick rate nudge is exactly the
+		 * output-cadence jitter v2 must not emit (the stagebox recovers word clock from the emit IFI).
+		 * Short-term occupancy swings are absorbed by the ring depth and trimmed only glacially by the
+		 * PLL below; bias_ppm stays 0 so the emit period free-runs at the (PLL-trimmed) base. */
+		if (!g_steady && have && ++servo_div >= 64) {
 			double dpos = (min_ema - shtgt) - SERVO_SETPOINT;   /* >0: even the tightest port has slack -> drain */
 			servo_integ += dpos;
 			double raw = SERVO_KP * dpos + SERVO_KI * servo_integ;
@@ -653,9 +1191,13 @@ int main(int argc, char **argv) {
 			}
 			drift_prev = rel; drift_div = 0;
 		}
-		/* glacial frequency-lock (the converging PLL). Self-stopping: as the drift goes to
-		 * zero the correction goes to zero -> a constant exact rate, no audible modulation. */
-		if (g_pll && eq_done && have && ++pll_div >= PLL_WIN) {
+		/* glacial frequency-lock (the converging PLL) -- the long-term rate lock AND, in steady mode,
+		 * the ONLY path occupancy is allowed to touch the clock. Integrated over PLL_WIN ticks (seconds)
+		 * and clamped to PLL_MAXPPM per window, so the correction is sub-ppm and self-stopping: as the
+		 * drift goes to zero the correction goes to zero -> a constant exact rate, no audible modulation.
+		 * Steady mode runs this even without --pll (it IS steady mode's occupancy trim); a short-term WDS
+		 * burst shows as an occupancy swing that averages out within a window and never reaches the rate. */
+		if ((g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
 			double msum = 0; int mc = 0;
 			for (int i = 0; i < n_streams; i++)
 				if (streams[i].started && streams[i].n_rx) { msum += streams[i].occ_ema; mc++; }
@@ -669,12 +1211,30 @@ int main(int argc, char **argv) {
 				if (adj >  PLL_MAXPPM) adj =  PLL_MAXPPM;
 				else if (adj < -PLL_MAXPPM) adj = -PLL_MAXPPM;
 				period_ns = (long)((double)period_ns * (1.0 + adj * 1e-6) + 0.5);
-				period = (double)period_ns * (1.0 - bias_ppm * 1e-6);
+				period = (double)period_ns * (1.0 - bias_ppm * 1e-6);   /* steady: bias_ppm==0 -> period==base */
 				pll_ref = mocc;
 			}
 			pll_div = 0;
 		}
-		deadline += (long long)(period + 0.5);
+		/* warm-start persist (~every 30 s once converged): write the live base period out per port so
+		 * the NEXT start (restart or deploy) seeds the PLL already-locked. Gated on eq_done + no in-flight
+		 * depth walk so we never snapshot a transient; the file write is off the jitter-critical emit. */
+		if (g_warm_start && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
+			lock_save(period_ns);
+			lock_div = 0;
+		}
+		/* glitch-free occupancy retarget: while a depth change is walking in, bias THIS tick's
+		 * period by retarget_ppm (on top of the servo/PLL period) so the occupancy slides toward
+		 * the new target without a flush. The walk is bounded + short, then it hands the steady
+		 * state back to the servo/PLL at the new target. emit_period is per-tick; period (the base)
+		 * is left untouched so the loop's own control is undisturbed when the walk ends. */
+		double emit_period = period;
+		if (retarget_ticks > 0) {
+			emit_period = period * (1.0 - retarget_ppm * 1e-6);   /* +ppm = faster = drain/shrink */
+			retarget_ticks--;
+			if (retarget_ticks == 0) retarget_ppm = 0.0;
+		}
+		deadline += (long long)(emit_period + 0.5);
 		long long now = ns_now();
 		if (now - last > 1000000000LL) {
 			/* continuous rate detection: a SAMPLE-RATE change shifts the busiest port's input
@@ -725,7 +1285,7 @@ int main(int argc, char **argv) {
 				/* UNISON: re-arm the occupancy-anchor at the new rate -- re-snapshot the common floor
 				 * and clear eq_done (stream_relock already set started=0) so every port re-gates on the
 				 * new floor; reseed the PLL so it re-converges from the new equalized state. */
-				eq_floor = prefill; eq_done = 0; pll_ref = -1.0; pll_div = 0;
+				eq_floor = prefill; eq_done = 0; pll_ref = -1.0; pll_div = 0; lock_div = 0;
 				for (int i = 0; i < n_streams; i++) {
 					if (streams[i].n_rx == 0) continue;
 					int occ = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE) - streams[i].r_head) & RING_MASK);
@@ -733,9 +1293,14 @@ int main(int argc, char **argv) {
 				}
 				if (eq_floor > streams[0].occ_cap - 1) eq_floor = streams[0].occ_cap - 1;
 				for (int i = 0; i < n_streams; i++) streams[i].last_in = streams[i].g_in_frames;
+				/* the relock re-prefills from scratch at the new period: abandon any in-flight depth
+				 * walk and re-base the live-reconfig view (prefill_ms unchanged; period_ns is new, so
+				 * a later set computes its slot count correctly). */
+				retarget_ticks = 0; retarget_ppm = 0.0; live.period_ns = period_ns;
 				fprintf(stderr, "auto-rate: input rate changed to %.0f pps (%.1f kHz) -> re-locked all ports, period=%ld ns, eq_floor=%d\n", in_pps, in_pps * 12.0 / 1000.0, period_ns, eq_floor);
 				deadline = ns_now() + period_ns; last = ns_now(); continue;
 			}
+			live.period_ns = period_ns;   /* keep the live-reconfig view current (PLL/base tracker drift the base) */
 			/* per-port telemetry line */
 			fprintf(stderr, "per=%.0f bias=%+.0fppm", period, bias_ppm);
 			for (int i = 0; i < n_streams; i++) {
@@ -750,6 +1315,11 @@ int main(int argc, char **argv) {
 			last = now;
 		}
 	}
+	/* persist the converged lock on a clean exit so a stop/start (or deploy) restarts already-locked */
+	if (g_warm_start && eq_done) lock_save(period_ns);
+#ifdef HAVE_UBUS
+	if (g_ubus_ctx) ubus_free(g_ubus_ctx);
+#endif
 	for (int i = 0; i < n_streams; i++)
 		fprintf(stderr, "repacer: stop %s->%s rx=%llu tx=%llu txerr=%llu under=%llu | ret=%llu reterr=%llu\n",
 		        streams[i].in_name, streams[i].out_name, streams[i].n_rx, streams[i].n_tx, streams[i].n_txerr, streams[i].n_underrun, streams[i].n_ret, streams[i].n_reterr);

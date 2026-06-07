@@ -4,13 +4,15 @@
 		"read": {
 			"uci": [ "reac-repacer" ],
 			"ubus": {
-				"service": [ "list" ]
+				"service": [ "list" ],
+				"reac_repacer": [ "get" ]
 			}
 		},
 		"write": {
 			"uci": [ "reac-repacer" ],
 			"ubus": {
-				"service": [ "event" ]
+				"service": [ "event" ],
+				"reac_repacer": [ "set" ]
 			}
 		}
 	}

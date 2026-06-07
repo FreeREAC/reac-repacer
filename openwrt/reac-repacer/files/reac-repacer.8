@@ -1,0 +1,246 @@
+.\" SPDX-License-Identifier: GPL-3.0-or-later
+.\" Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
+.TH REAC-REPACER 8 "2026-06-07" "reac-repacer 0.1.0" "System Manager's Manual"
+.SH NAME
+reac-repacer \- de-jitter / re-pacing relay for a Roland REAC stream over Wi-Fi
+.SH SYNOPSIS
+.B reac-repacer
+.B \-\-port
+.I IN:OUT
+.RB [ \-\-port
+.IR IN:OUT " ...]"
+.RB [ \-\-prefill\-ms
+.IR N ]
+.RB [ \-\-servo\-clamp\-ppm
+.IR N ]
+.RB [ \-\-pll ]
+.RB [ \-\-forward\-only ]
+.RB [ \-\-bcast\-only ]
+.RB [ \-\-cpu
+.IR N ]
+.RB [ \-\-adapt ]
+.RB [ \-\-adapt\-min\-ms
+.IR N ]
+.RB [ \-\-adapt\-max\-ms
+.IR N ]
+.RB [ \-\-adapt\-margin
+.IR N ]
+.RB [ \-\-reclaim ]
+.RB [ \-\-no\-steady ]
+.RB [ \-\-no\-warm\-start ]
+.RB [ \-\-lockfile
+.IR PATH ]
+.br
+.B reac-repacer
+.RB { \-h | \-\-help }
+.SH DESCRIPTION
+.B reac-repacer
+is a transparent Layer-2 relay that de-jitters a Roland REAC stream
+(EtherType 0x8819) carried over a bursty Wi-Fi / WDS path. It sits between the
+tunnel side (Wi-Fi, bursty) and the local REAC stagebox and re-emits the master
+broadcast at a constant cadence, filling the gaps a clock-slave stagebox cannot
+tolerate.
+.PP
+For each port the daemon buffers the incoming master broadcast for a few
+milliseconds and re-emits it on a steady, free-running output clock derived from
+the detected sample rate (44.1 / 48 / 96 kHz). Because the stagebox recovers its
+word clock from the emit inter-frame interval, the output cadence is held free of
+short-term wireless jitter: bursts are absorbed as buffer occupancy swings and
+never reach the cadence; occupancy is used only as a slow, sub-ppm trim. The
+return direction (stagebox to tunnel) is passed straight through, since the master
+owns the clock and tolerates input jitter.
+.PP
+One daemon handles one or more REAC ports of a single mixer on one shared pacing
+clock, so the stageboxes stay sample-phase-aligned with each other. The relay does
+not decode REAC, reorder or alter bytes, or do VLAN tagging.
+.PP
+At least one
+.B \-\-port
+is required. There is no implicit default: invoked with no port, or with an
+unknown flag, the daemon prints usage and exits non-zero rather than launching a
+pacer on default interfaces.
+.SH OPTIONS
+.TP
+.BI \-\-port " IN:OUT"
+Define a REAC port as an IN:OUT interface pair (IN = tunnel side, OUT = stagebox
+side). Repeat the option once per port. Required.
+.TP
+.BI \-\-prefill\-ms " N"
+Target buffer depth, in milliseconds, filled before emitting begins. Default 12.
+.TP
+.BI \-\-servo\-clamp\-ppm " N"
+Drain-servo clock-bias clamp, in ppm; bounds how fast latency is reclaimed.
+Default 700.
+.TP
+.B \-\-pll
+Enable the glacial frequency-lock that converges the base period to null the
+long-term occupancy drift. Default off.
+.TP
+.B \-\-forward\-only
+De-jitter only the forward (IN to OUT) direction and do not run the return
+pass-through thread. Used on the mixer side. Default off.
+.TP
+.B \-\-bcast\-only
+Accept only the master broadcast frames. Default off.
+.TP
+.BI \-\-cpu " N"
+Core to pin the real-time (SCHED_FIFO) pacing thread to. Default 3.
+.TP
+.B \-\-adapt
+Auto-size the buffer to the observed burst depth. Default off.
+.TP
+.BI \-\-adapt\-min\-ms " N"
+Floor latency, in milliseconds, when shrinking the adaptive window. Default 6.
+.TP
+.BI \-\-adapt\-max\-ms " N"
+Ceiling latency, in milliseconds, when growing the adaptive window. Default 120.
+.TP
+.BI \-\-adapt\-margin " N"
+Keep the occupancy low-water mark this many slots above zero (safety headroom).
+Default 20.
+.TP
+.B \-\-reclaim
+Actively shrink latency. This may drop frames and cause clicks; the default
+behaviour is grow-only. Default off.
+.TP
+.B \-\-no\-steady
+Disable the steady free-running output clock and restore the per-tick,
+servo-paced cadence. The steady clock is on by default.
+.TP
+.B \-\-no\-warm\-start
+Do not persist or restore the converged lock. Warm-start is on by default.
+.TP
+.BI \-\-lockfile " PATH"
+Path of the warm-start state file. Default /etc/reac-repacer.lock.
+.TP
+.BR \-h ", " \-\-help
+Print the usage message to standard output and exit 0 without starting the
+daemon.
+.SH STEADY CLOCK AND WARM-START
+With the steady free-running output clock (on by default), the emit period
+free-runs at the detected base period and is not modulated per tick or per
+occupancy swing. Short-term WDS bursts are absorbed as ring-depth swings and never
+reach the output cadence, which removes the audible cadence jitter heard on
+silences. Occupancy is used only as a glacial trim: the PLL, integrated over
+seconds, nudges the base period sub-ppm to null the long-term rate error.
+.PP
+A glacial lock takes minutes to converge, and a cold start spends those minutes
+audibly converging. Warm-start (on by default) persists the converged per-port
+emit period to a small state file and, on startup, seeds the base period from it
+so the daemon starts already locked. The lock is keyed per output interface, so a
+router restores only the periods for the ports it is configured with, and only
+when the saved rate label matches the rate detected at startup. A missing or
+invalid file is tolerated: the daemon cold-starts exactly as it would without one.
+.SH UBUS INTERFACE
+When built with libubus support, the daemon registers a
+.B reac_repacer
+ubus object with two methods.
+.TP
+.B get
+Return a live snapshot: the current target depth, base period, per-port occupancy
+and counters, and whether an occupancy retarget walk is in progress.
+.IP
+.RS
+.nf
+ubus call reac_repacer get
+.fi
+.RE
+.TP
+.B set
+Stage a hot retune of the reloadable parameters, applied on the next pacing tick
+with no audio dropout. The hot parameters are
+.IR prefill_ms ,
+.IR adapt_min_ms ,
+.IR adapt_max_ms ,
+.IR adapt_margin
+and
+.IR servo_clamp_ppm .
+A target-depth change does not flush the ring: the occupancy is walked to the new
+depth by a small, bounded clock bias, so audio stays continuous and only the
+latency moves.
+.IP
+.RS
+.nf
+ubus call reac_repacer set '{"prefill_ms":150}'
+.fi
+.RE
+.PP
+Structural parameters (the port / interface mapping and the pinned CPU) are
+restart-only: a live change to them over ubus is rejected, not silently ignored.
+.SH SIGNALS
+.TP
+.B SIGHUP
+Re-read the hot parameters from the UCI configuration
+.RB ( /etc/config/reac-repacer ,
+section
+.BR main )
+and apply them through the same glitch-free path as a ubus
+.B set
+(omitted options keep their running value). This is how the procd
+.B reload
+trigger retunes a running daemon.
+.TP
+.BR SIGINT ", " SIGTERM
+Shut the daemon down cleanly.
+.SH FILES
+.TP
+.I /etc/reac-repacer.lock
+Warm-start state file (overridable with
+.BR \-\-lockfile ).
+Line-oriented text, one record per output port, with
+.RB ` # '
+comments and blank lines ignored:
+.IP
+.RS
+.nf
+<out_iface> <emit_period_ns> <rate_label_hz> <unix_epoch>
+.fi
+.RE
+.IP
+For example:
+.IP
+.RS
+.nf
+lan1 124867 96000 1749150000
+.fi
+.RE
+.TP
+.I /etc/config/reac-repacer
+UCI configuration read at startup and on
+.BR SIGHUP .
+The
+.B main
+section holds the global and hot parameters; each
+.B port
+section is one REAC zone.
+.SH EXAMPLES
+Three ports of one mixer with a 16 ms target depth:
+.PP
+.RS
+.nf
+reac-repacer \-\-port reactap.11:lan1 \-\-port reactap.12:lan2 \\
+    \-\-port reactap.13:lan3 \-\-prefill\-ms 16
+.fi
+.RE
+.PP
+Mixer-side placement, de-jittering only the forward direction with an adaptive
+window:
+.PP
+.RS
+.nf
+reac-repacer \-\-port reactap.11:lan1 \-\-forward\-only \-\-adapt
+.fi
+.RE
+.PP
+Retune the target depth of a running daemon over ubus, with no dropout:
+.PP
+.RS
+.nf
+ubus call reac_repacer set '{"prefill_ms":24}'
+.fi
+.RE
+.SH SEE ALSO
+.BR ubus (1),
+.BR procd (8)
+.SH AUTHOR
+Pau Aliagas <linuxnow@gmail.com>
