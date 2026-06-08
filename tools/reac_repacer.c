@@ -134,17 +134,41 @@ static int g_adapt_max_ms  = 120;   /* ceiling latency when growing */
 static int g_plc = 1;               /* gap concealment: repeat last frame (next counter) on underrun */
 static int g_reclaim;               /* opt-in: actively shrink latency (drops -> clicks). Default grow-only. */
 static int g_pll;                   /* glacial frequency-lock: converge BASE period to null occ drift */
-/* The PLL: every PLL_WIN ticks, nudge the base period to (a) zero the mean-occupancy
- * drift over the window [frequency] and (b) gently recenter occ on the target [position].
- * Each step is clamped tiny (PLL_MAXPPM) so there is NO audible rate modulation; the
- * residual halves each window until refinement gains nothing -> a constant exact rate.
+/* The PLL: a HOLD-then-correct frequency lock. The emit period (= the stagebox's recovered
+ * word clock) is held DEAD CONSTANT and re-trimmed ONLY when the buffer has drifted past a
+ * frame threshold -- i.e. when the accumulated rate error has grown enough to matter. Between
+ * trims the cadence does not move at all (no per-window occupancy-noise hunting, no periodic
+ * step), so there is no audible rate modulation. Each trim nulls the *measured* rate error
+ * (drift / elapsed ticks), clamped to PLL_MAXPPM so even the rare correction is inaudible. A
+ * wide position band adds a gentle pull only if occ wanders far from target (rail safety over
+ * a long show). Measuring drift over a long baseline (not per-window) is what lets a warm-
+ * started, already-correct period simply never trip the trigger -> it just holds.
  * Runs with the fast servo OFF (--servo-clamp-ppm 0), preserving constant-rate clarity. */
-#define PLL_WIN     32000   /* correction window in ticks (~4 s @ 8000 fps) */
-#define PLL_FGAIN   0.6     /* frequency gain: fraction of measured drift corrected per window */
-#define PLL_PGAIN   0.12    /* position gain: gentle recenter toward target */
-#define PLL_MAXPPM  500.0   /* max base-period step per window (ppm) -- keeps each step inaudible */
+#define PLL_WIN          32000  /* evaluation window in ticks (~4 s @ 8000 fps) */
+#define PLL_FGAIN        0.6    /* fraction of the measured rate error nulled per correction */
+#define PLL_TRIG_FRAMES  24.0   /* drift that triggers a correction: ~3 ms of buffer movement.
+                                 * Well above per-window occupancy noise, far below any rail, so a
+                                 * real rate error is caught while noise never trips it. At a 2-12 ppm
+                                 * residual this fires only every ~4-25 min. */
+#define PLL_POS_BAND     64.0   /* occ band (~8 ms) around target. INSIDE it the clock just holds + rate-
+                                 * locks (inaudible). OUTSIDE it (a WDS-stall drain or cold start left occ
+                                 * far from target) the loop adds a proportional occupancy RECOVERY and
+                                 * widens the clamp so the buffer is steered back to a safe depth. */
+#define PLL_RECOVER_SECS 60.0   /* off-band: steer occ back to target over ~this long (proportional, clamped
+                                 * to PLL_ACQ_PPM). Gentle (~sub-cent) for a small excursion; ramps toward
+                                 * the 500 ppm clamp only for a deep/dangerous drain -- rare, and beats a
+                                 * rail. Rate-lock (the inaudible steady-state job) is unaffected. */
+#define PLL_MAXPPM       30.0   /* LOCKED clamp: max single steady-state correction (ppm). 30 ppm =
+                                 * ~0.05 cents, inaudible even on a sustained sine. WAS 500.0 = 0.87
+                                 * cents, which railed audibly (the "rubbery clock" shimmer) whenever
+                                 * the loop corrected before convergence. Once locked, every step is
+                                 * this small; warm-start seeds the period already-locked. */
+#define PLL_ACQ_PPM      500.0  /* ACQUIRE clamp: used only BEFORE lock, when the buffer is mid
+                                 * fill/drain and not yet a stable pitch reference -- a big step is
+                                 * inaudible-in-context here and pulls the master's full crystal offset
+                                 * (reac2 ~+568 ppm) out in ~1 min instead of hours. Drops to
+                                 * PLL_MAXPPM the moment a trigger's required correction fits within it. */
 static double g_pll_fgain = PLL_FGAIN;   /* runtime override (--pll-fgain) */
-static double g_pll_pgain = PLL_PGAIN;   /* runtime override (--pll-pgain); 0 = pure frequency-lock, no recenter */
 static int    g_pll_pos_min = 0;         /* position-control source: 0=mean depth (default), 1=tightest port (--pll-pos-min) */
 
 /* STEADY free-running output clock (the primary audio-quality fix, design §3 + §3b).
@@ -830,7 +854,6 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
 		else if (!strcmp(argv[i], "--pll")) g_pll = 1;
 		else if (!strcmp(argv[i], "--pll-fgain") && i + 1 < argc) g_pll_fgain = atof(argv[++i]);
-		else if (!strcmp(argv[i], "--pll-pgain") && i + 1 < argc) g_pll_pgain = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--pll-pos-min")) g_pll_pos_min = 1;
 		else if (!strcmp(argv[i], "--steady")) g_steady = 1;
 		else if (!strcmp(argv[i], "--no-steady")) g_steady = 0;
@@ -1070,7 +1093,8 @@ int main(int argc, char **argv) {
 	double max_ppm = (double)g_servo_clamp_ppm;
 	int servo_div = 0;
 	int drift_div = 0; double drift_prev = 1e9;   /* base tracker: null long-term occ-vs-target drift */
-	int pll_div = 0; double pll_ref = -1.0;        /* glacial PLL: converge base period to null occ drift */
+	int pll_div = 0; double pll_occ_ref = -1.0; long long pll_elapsed = 0;  /* hold-then-correct PLL: occ baseline + ticks since last trim (64-bit: >74h hold on 32-bit long) */
+	int pll_locked = 0;                            /* 0 = cold acquire (wide clamp), 1 = converged (inaudible 30 ppm clamp) */
 	int lock_div = 0;                              /* warm-start: persist the converged lock periodically */
 	/* ONE shared target for all ports (they share a clock + a source). Sized to the worst
 	 * low-water dip across ports + margin: grow at once to cover a burst, ease down ~1 slot/4s
@@ -1191,35 +1215,59 @@ int main(int argc, char **argv) {
 			}
 			drift_prev = rel; drift_div = 0;
 		}
-		/* glacial frequency-lock (the converging PLL) -- the long-term rate lock AND, in steady mode,
-		 * the ONLY path occupancy is allowed to touch the clock. Integrated over PLL_WIN ticks (seconds)
-		 * and clamped to PLL_MAXPPM per window, so the correction is sub-ppm and self-stopping: as the
-		 * drift goes to zero the correction goes to zero -> a constant exact rate, no audible modulation.
-		 * Steady mode runs this even without --pll (it IS steady mode's occupancy trim); a short-term WDS
-		 * burst shows as an occupancy swing that averages out within a window and never reaches the rate. */
+		/* hold-then-correct frequency lock -- the long-term rate lock AND, in steady mode, the ONLY
+		 * path occupancy is allowed to touch the clock. The period is HELD CONSTANT and re-trimmed
+		 * only when the buffer has drifted >= PLL_TRIG_FRAMES since the last trim (a real rate error,
+		 * measured over a long baseline so it sits well above per-window occupancy noise) or occ has
+		 * wandered outside PLL_POS_BAND of target (rail safety). The trim nulls the measured rate
+		 * error (drift / elapsed ticks), clamped to PLL_MAXPPM so even the rare correction is inaudible.
+		 * Steady mode runs this even without --pll (it IS steady mode's occupancy trim); short-term WDS
+		 * bursts show as occupancy swings on occ_ema that stay inside the band and never reach the rate. */
 		if ((g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
 			double msum = 0; int mc = 0;
 			for (int i = 0; i < n_streams; i++)
 				if (streams[i].started && streams[i].n_rx) { msum += streams[i].occ_ema; mc++; }
 			if (mc) {
-				double mocc = msum / mc;
-				if (pll_ref < 0) pll_ref = mocc;
-				double docc = mocc - pll_ref;                                   /* drift over the window */
-				double pos  = g_pll_pos_min ? min_ema : mocc;                          /* recenter source: tightest port or mean depth */
-				double adj  = -(docc / (double)PLL_WIN) * 1e6 * g_pll_fgain              /* freq: null the (parallel) mean drift */
-				              - ((pos - shtgt) / (double)PLL_WIN) * 1e6 * g_pll_pgain;   /* pos: gentle recenter toward the safe window (rule 5; clean equal start makes mean-recenter drain both equally) */
-				if (adj >  PLL_MAXPPM) adj =  PLL_MAXPPM;
-				else if (adj < -PLL_MAXPPM) adj = -PLL_MAXPPM;
-				period_ns = (long)((double)period_ns * (1.0 + adj * 1e-6) + 0.5);
-				period = (double)period_ns * (1.0 - bias_ppm * 1e-6);   /* steady: bias_ppm==0 -> period==base */
-				pll_ref = mocc;
+				double mean_occ = msum / mc;
+				pll_elapsed += PLL_WIN;
+				if (pll_occ_ref < 0) { pll_occ_ref = mean_occ; pll_elapsed = 0; }  /* first window: set baseline + zero elapsed so drift/elapsed is exact from the next window (no off-by-one) */
+				double drift = mean_occ - pll_occ_ref;                        /* buffer movement since the last trim */
+				double pos   = g_pll_pos_min ? min_ema : mean_occ;            /* position source: tightest port or mean depth */
+				double err_t = pos - shtgt;                                   /* distance from the ideal target depth */
+				if ((drift >= PLL_TRIG_FRAMES || drift <= -PLL_TRIG_FRAMES ||
+				     err_t >= PLL_POS_BAND   || err_t <= -PLL_POS_BAND) && pll_elapsed > 0) {
+					double adj = -(drift / (double)pll_elapsed) * 1e6 * g_pll_fgain;   /* rate-lock: null the measured rate error */
+					/* OFF-BAND occupancy recovery: a WDS-stall drain (or cold start) left occ far from target.
+					 * The gentle rate-lock alone would take ~minutes to refill a deep deficit, sitting near a
+					 * rail meanwhile. Add a proportional pull that steers occ back over ~PLL_RECOVER_SECS and
+					 * widen the clamp -- gentle/sub-cent for a small excursion, ramping to the 500 ppm clamp only
+					 * for a deep drain. (err_t<0 = too empty -> +adj = longer period = slower = fills; symmetric.) */
+					int off_band = (err_t >= PLL_POS_BAND || err_t <= -PLL_POS_BAND);
+					if (off_band) adj += -err_t / (PLL_RECOVER_SECS * 8000.0) * 1e6;
+					/* LOCK detection: only IN-BAND (an undisturbed steady state) AND once the required (raw,
+					 * pre-clamp) rate correction already fits within the inaudible clamp -> latch locked and stay
+					 * in the 30 ppm regime. (Detect on correction magnitude, NOT drift-within-window, which is
+					 * small by construction between triggers and would latch on the very first window.) */
+					if (!off_band && adj <= PLL_MAXPPM && adj >= -PLL_MAXPPM) pll_locked = 1;
+					/* regime clamp: 30 ppm (inaudible) only when LOCKED and IN-BAND; wide (500 ppm) while
+					 * acquiring OR recovering off-band -- both regimes where the buffer is not yet a stable
+					 * pitch reference, so a larger step is acceptable and gets us safe fast. */
+					double clamp = (pll_locked && !off_band) ? PLL_MAXPPM : PLL_ACQ_PPM;
+					if (adj >  clamp) adj =  clamp;
+					else if (adj < -clamp) adj = -clamp;
+					period_ns = (long)((double)period_ns * (1.0 + adj * 1e-6) + 0.5);
+					period = (double)period_ns * (1.0 - bias_ppm * 1e-6);   /* steady: bias_ppm==0 -> period==base */
+					pll_occ_ref = mean_occ;                                  /* re-baseline the hold point */
+					pll_elapsed = 0;
+				}
 			}
 			pll_div = 0;
 		}
 		/* warm-start persist (~every 30 s once converged): write the live base period out per port so
-		 * the NEXT start (restart or deploy) seeds the PLL already-locked. Gated on eq_done + no in-flight
-		 * depth walk so we never snapshot a transient; the file write is off the jitter-critical emit. */
-		if (g_warm_start && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
+		 * the NEXT start (restart or deploy) seeds the PLL already-locked. Gated on pll_locked so we only
+		 * ever persist a CONVERGED period (never a pre-lock transient), plus eq_done + no in-flight depth
+		 * walk; the file write is off the jitter-critical emit. */
+		if (g_warm_start && pll_locked && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
 			lock_save(period_ns);
 			lock_div = 0;
 		}
@@ -1285,7 +1333,7 @@ int main(int argc, char **argv) {
 				/* UNISON: re-arm the occupancy-anchor at the new rate -- re-snapshot the common floor
 				 * and clear eq_done (stream_relock already set started=0) so every port re-gates on the
 				 * new floor; reseed the PLL so it re-converges from the new equalized state. */
-				eq_floor = prefill; eq_done = 0; pll_ref = -1.0; pll_div = 0; lock_div = 0;
+				eq_floor = prefill; eq_done = 0; pll_occ_ref = -1.0; pll_elapsed = 0; pll_locked = 0; pll_div = 0; lock_div = 0;
 				for (int i = 0; i < n_streams; i++) {
 					if (streams[i].n_rx == 0) continue;
 					int occ = (int)((__atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE) - streams[i].r_head) & RING_MASK);
@@ -1315,8 +1363,9 @@ int main(int argc, char **argv) {
 			last = now;
 		}
 	}
-	/* persist the converged lock on a clean exit so a stop/start (or deploy) restarts already-locked */
-	if (g_warm_start && eq_done) lock_save(period_ns);
+	/* persist the converged lock on a clean exit so a stop/start (or deploy) restarts already-locked.
+	 * Gated on pll_locked: never persist a pre-convergence period (it would warm-restore a bad rate). */
+	if (g_warm_start && pll_locked && eq_done) lock_save(period_ns);
 #ifdef HAVE_UBUS
 	if (g_ubus_ctx) ubus_free(g_ubus_ctx);
 #endif
