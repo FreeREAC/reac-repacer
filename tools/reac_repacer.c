@@ -200,6 +200,10 @@ static int g_steady = 1;             /* default ON in v2 (--no-steady restores v
  * rate label matches the rate it detected at startup (a 44.1<->48<->96 k change invalidates it). */
 static const char *g_lockfile = "/etc/reac-repacer.lock";
 static int   g_warm_start = 1;       /* default ON (--no-warm-start disables persist + restore) */
+static int    g_detect_ms = 60;             /* rate-change detection window ms (--detect-ms) */
+static int    g_detect_confirm = 2;         /* consecutive windows to confirm a family change (--detect-confirm) */
+static int    g_mute_ms = 250;              /* silence audio across a rate-change transition (--mute-ms) */
+static volatile long long g_mute_until = 0; /* ns deadline: emit silent audio until this time */
 #define LOCK_SAVE_WIN  240000        /* persist the converged lock ~every 30 s @ 8000 fps */
 
 struct iface { int fd; int ifindex; struct sockaddr_ll tx; };
@@ -244,6 +248,30 @@ static void on_hup(int s) { (void)s; got_hup = 1; }   /* defer the work to the m
 static long long ns_now(void) {
 	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
 	return (long long)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* ---- wired-clock meter (--clock-source local) --------------------------------------
+ * Count REAC frames on the wired OUT port and divide by elapsed time: the wire is
+ * lossless and jitter-light, so period = elapsed/(frames-1) converges on the sender's
+ * crystal with precision ~1/T (sub-ppm after seconds). Every REAC stream in the rig is
+ * synchronous to ONE crystal (the boxes lock to the master), so the wired cadence IS
+ * the exact rate the emit needs: rate exact -> occupancy holds -> the occupancy-chasing
+ * loops (servo/tracker/PLL recovery) are bypassed entirely and never modulate the
+ * cadence. WiFi carries data, never timing. */
+static int g_clock_local;                       /* --clock-source local */
+static volatile unsigned long long g_met_n;     /* frames counted since window start */
+static volatile long long g_met_t0, g_met_tlast;
+static volatile sig_atomic_t g_met_reset;       /* pacer: family went stale -> re-measure */
+
+static void met_tick(long long *t_prev) {
+	long long t = ns_now();
+	if (g_met_reset) { g_met_reset = 0; g_met_n = 0; }
+	if (*t_prev && t - *t_prev > 250000000LL) g_met_n = 0;       /* stream gap (relink / rate change) -> fresh window */
+	if (g_met_n && t - g_met_t0 > 600000000000LL) g_met_n = 0;   /* re-baseline ~10 min: track thermal drift, don't average across it */
+	*t_prev = t;
+	if (!g_met_n) g_met_t0 = t;
+	g_met_tlast = t;
+	g_met_n++;                                   /* count written last: a reader's snapshot error is ~1/n */
 }
 
 static int open_iface(const char *name, struct iface *o) {
@@ -309,14 +337,34 @@ static void *fwd_rx(void *arg) {
 /* return relay: stagebox -> tunnel, immediate (master tolerates input jitter) */
 static void *ret_relay(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
+	long long met_prev = 0;
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
 		if (n < 14) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* never echo the master back -> no loop */
 		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;        /* REAC frames (incl handshake) */
+		if (g_clock_local && s == &streams[0]) met_tick(&met_prev);  /* wired-clock meter rides the relay */
 		if (sendto(s->IN.fd, buf, (size_t)n, 0, (struct sockaddr *)&s->IN.tx, sizeof s->IN.tx) < 0) s->n_reterr++;
 		else s->n_ret++;
+	}
+	return NULL;
+}
+
+/* wired-clock meter thread (--clock-source local, --forward-only): the return path is
+ * the kernel bridge's, so nothing else reads OUT's socket -- this thread drains it and
+ * counts the local wired device's REAC frames. The count IS the master clock. */
+static void *clk_meter(void *arg) {
+	struct stream *s = arg; uint8_t buf[SLOT_SZ];
+	long long t_prev = 0;
+	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;   /* flush backlog */
+	while (running) {
+		struct sockaddr_ll from; socklen_t fl = sizeof from;
+		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+		if (n < 14) continue;
+		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* our own emit is not the reference */
+		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;
+		met_tick(&t_prev);
 	}
 	return NULL;
 }
@@ -451,6 +499,8 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 		if (s->have_last) {
 			memcpy(s->plc_buf, s->slot_buf[s->last_idx], s->slot_len[s->last_idx]);
 			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
+			if (g_mute_until && ns_now() < g_mute_until && s->plc_buf[16] == 0 && s->plc_buf[17] == 0 && s->slot_len[s->last_idx] > 18)
+				memset(s->plc_buf + 18, 0, s->slot_len[s->last_idx] - 18);
 			if (sendto(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], 0, (struct sockaddr *)&s->OUT.tx, sizeof s->OUT.tx) < 0) s->n_txerr++;
 			else s->n_plc++;
 			s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
@@ -459,6 +509,8 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 		uint8_t *f = s->slot_buf[head];
 		if (!s->have_last) s->emit_ctr = f[14] | (f[15] << 8);                /* seed the counter */
 		f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;        /* own a monotonic output counter */
+		if (g_mute_until && ns_now() < g_mute_until && f[16] == 0 && f[17] == 0 && s->slot_len[head] > 18)
+			memset(f + 18, 0, s->slot_len[head] - 18);   /* transition mute: silence audio payload, keep link control */
 		if (sendto(s->OUT.fd, f, s->slot_len[head], 0, (struct sockaddr *)&s->OUT.tx, sizeof s->OUT.tx) < 0) s->n_txerr++;
 		s->last_idx = (int)head; s->have_last = 1;
 		__atomic_store_n(&s->r_head, (head + 1) & RING_MASK, __ATOMIC_RELEASE); s->n_tx++;
@@ -806,6 +858,9 @@ static void usage(FILE *f) {
 "  --forward-only         de-jitter only the forward (IN->OUT) direction and do not\n"
 "                         run the return pass-through (mixer side; default off)\n"
 "  --bcast-only           accept only the master broadcast frames (default off)\n"
+"  --clock-source S       emit clock reference: wifi (occupancy PLL, default) or local\n"
+"                         (count frames on the wired OUT port = the master crystal,\n"
+"                         exact; WiFi then carries data, never timing)\n"
 "  --cpu N                core to pin the real-time pacing thread to (default 3)\n"
 "\n"
 "Warm-start state:\n"
@@ -840,6 +895,9 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--prefill-ms") && i + 1 < argc) prefill_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--period-ns") && i + 1 < argc) { period_ns = atol(argv[++i]); g_auto_rate = 0; }
 		else if (!strcmp(argv[i], "--cpu") && i + 1 < argc) cpu = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--detect-ms") && i + 1 < argc) g_detect_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--detect-confirm") && i + 1 < argc) g_detect_confirm = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--mute-ms") && i + 1 < argc) g_mute_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--prio") && i + 1 < argc) prio = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--bcast-only")) g_bcast_only = 1;
 		else if (!strcmp(argv[i], "--bypass")) g_bypass = 1;
@@ -852,6 +910,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
 		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
 		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
+		else if (!strcmp(argv[i], "--clock-source") && i + 1 < argc) g_clock_local = !strcmp(argv[++i], "local");
 		else if (!strcmp(argv[i], "--pll")) g_pll = 1;
 		else if (!strcmp(argv[i], "--pll-fgain") && i + 1 < argc) g_pll_fgain = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--pll-pos-min")) g_pll_pos_min = 1;
@@ -918,6 +977,9 @@ int main(int argc, char **argv) {
 		pthread_create(&streams[i].rx_th, NULL, fwd_rx, &streams[i]);
 		if (!g_forward_only) pthread_create(&streams[i].ret_th, NULL, ret_relay, &streams[i]);
 	}
+	if (g_clock_local && g_forward_only) {   /* with the return relay running, it counts instead (same fd) */
+		pthread_t mt; pthread_create(&mt, NULL, clk_meter, &streams[0]);
+	}
 
 	/* one RT pacing thread (this one) on a dedicated core, isolated from the NIC IRQ core */
 	cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set); sched_setaffinity(0, sizeof set, &set);
@@ -959,8 +1021,9 @@ int main(int argc, char **argv) {
 			__atomic_store_n(&streams[i].r_head, __atomic_load_n(&streams[i].r_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
 	}
 
-	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d fwd_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d steady=%d warm=%d\n",
-	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_forward_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim, g_steady, g_warm_start);
+	fprintf(stderr, "repacer(multiport): %d port(s) prefill=%d (%d ms) period=%ld ns cpu=%d bcast_only=%d fwd_only=%d adapt=%d(%d-%dms) plc=%d reclaim=%d steady=%d warm=%d clk=%s\n",
+	        n_streams, prefill, prefill_ms, period_ns, cpu, g_bcast_only, g_forward_only, g_adapt, g_adapt_min_ms, g_adapt_max_ms, g_plc, g_reclaim, g_steady, g_warm_start,
+	        g_clock_local ? "local" : "wifi");
 	for (int i = 0; i < n_streams; i++)
 		fprintf(stderr, "  port %d: %s -> %s\n", i, streams[i].in_name, streams[i].out_name);
 
@@ -1083,6 +1146,14 @@ int main(int argc, char **argv) {
 
 	long long deadline = ns_now() + period_ns; double period = (double)period_ns;
 	long long last = ns_now();
+	/* wired-clock state (--clock-source local): base_per is the emit base period as a DOUBLE
+	 * (sub-ns rate resolution: 1 ns of period at 96 k is 8 ppm -- integer ns alone quantizes the
+	 * clock audibly over hours). dl_carry accumulates the fractional ns so the emitted cadence
+	 * is exactly base_per on average. clk_act latches once the meter is valid; while latched the
+	 * occupancy-chasing PLL below is bypassed (occupancy carries WiFi noise; the wire carries
+	 * the clock). Meter lost > 30 s -> unlatch, PLL resumes (graceful wifi fallback). */
+	double base_per = (double)period_ns, dl_carry = 0.0;
+	int clk_act = 0; long long clk_last_ok = 0;
 	/* drain servo: bias the one shared clock a few hundred ppm to steer the TIGHTEST active
 	 * port's smoothed occupancy onto its (adaptive) target -- fast to drain excess latency,
 	 * slow to fill, gated on the tightest port so none underruns. A steady, slowly-ramped
@@ -1223,7 +1294,7 @@ int main(int argc, char **argv) {
 		 * error (drift / elapsed ticks), clamped to PLL_MAXPPM so even the rare correction is inaudible.
 		 * Steady mode runs this even without --pll (it IS steady mode's occupancy trim); short-term WDS
 		 * bursts show as occupancy swings on occ_ema that stay inside the band and never reach the rate. */
-		if ((g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
+		if (!clk_act && (g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
 			double msum = 0; int mc = 0;
 			for (int i = 0; i < n_streams; i++)
 				if (streams[i].started && streams[i].n_rx) { msum += streams[i].occ_ema; mc++; }
@@ -1256,7 +1327,8 @@ int main(int argc, char **argv) {
 					if (adj >  clamp) adj =  clamp;
 					else if (adj < -clamp) adj = -clamp;
 					period_ns = (long)((double)period_ns * (1.0 + adj * 1e-6) + 0.5);
-					period = (double)period_ns * (1.0 - bias_ppm * 1e-6);   /* steady: bias_ppm==0 -> period==base */
+					base_per = (double)period_ns;
+					period = base_per * (1.0 - bias_ppm * 1e-6);   /* steady: bias_ppm==0 -> period==base */
 					pll_occ_ref = mean_occ;                                  /* re-baseline the hold point */
 					pll_elapsed = 0;
 				}
@@ -1267,7 +1339,7 @@ int main(int argc, char **argv) {
 		 * the NEXT start (restart or deploy) seeds the PLL already-locked. Gated on pll_locked so we only
 		 * ever persist a CONVERGED period (never a pre-lock transient), plus eq_done + no in-flight depth
 		 * walk; the file write is off the jitter-critical emit. */
-		if (g_warm_start && pll_locked && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
+		if (g_warm_start && (pll_locked || clk_act) && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
 			lock_save(period_ns);
 			lock_div = 0;
 		}
@@ -1282,9 +1354,10 @@ int main(int argc, char **argv) {
 			retarget_ticks--;
 			if (retarget_ticks == 0) retarget_ppm = 0.0;
 		}
-		deadline += (long long)(emit_period + 0.5);
+		dl_carry += emit_period;                       /* fractional-ns accumulation: cadence = emit_period exactly */
+		{ long long dstep = (long long)dl_carry; dl_carry -= (double)dstep; deadline += dstep; }
 		long long now = ns_now();
-		if (now - last > 1000000000LL) {
+		if (now - last > (long long)g_detect_ms * 1000000LL) {
 			/* continuous rate detection: a SAMPLE-RATE change shifts the busiest port's input
 			 * pps far from the pacing rate (a clock offset is <0.3%, a 44.1<->48<->96 k change is
 			 * 9-100%). Re-lock every port at the new rate instead of draining. */
@@ -1296,9 +1369,12 @@ int main(int argc, char **argv) {
 			long cand = nearest_std_pps(in_pps);
 			double cerr = (in_pps >= (double)cand) ? (in_pps - cand) / cand : (cand - in_pps) / cand;
 			int is_change = (g_auto_rate && in_pps > 2000.0 && cerr < 0.03 && cand != nearest_std_pps(1.0e9 / period_ns));
+			if (is_change && rate_chg == 0 && g_mute_ms > 0) g_mute_until = now + (long long)g_mute_ms * 1000000LL;   /* first sign of a rate change -> mute immediately */
 			if (is_change) rate_chg++; else rate_chg = 0;
-			if (rate_chg >= 3) {   /* a standard rate sustained ~3 s -> a real (rare) change */
+			if (rate_chg >= g_detect_confirm) {   /* a standard rate sustained the detect window -> a real (rare) change */
 				rate_chg = 0; period_ns = (long)(1.0e9 / in_pps + 0.5); period = (double)period_ns;  /* emit at the MEASURED rate of the new family (cand only DETECTS the change) */
+				base_per = (double)period_ns; dl_carry = 0.0;
+				clk_act = 0; g_met_reset = 1;   /* wired meter: stale family -> re-measure at the new rate */
 				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 				if (prefill < 1) prefill = 1;
 				if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
@@ -1346,11 +1422,43 @@ int main(int argc, char **argv) {
 				 * a later set computes its slot count correctly). */
 				retarget_ticks = 0; retarget_ppm = 0.0; live.period_ns = period_ns;
 				fprintf(stderr, "auto-rate: input rate changed to %.0f pps (%.1f kHz) -> re-locked all ports, period=%ld ns, eq_floor=%d\n", in_pps, in_pps * 12.0 / 1000.0, period_ns, eq_floor);
+				if (g_mute_ms > 0) g_mute_until = ns_now() + (long long)g_mute_ms * 1000000LL;   /* hold silence through re-prefill */
 				deadline = ns_now() + period_ns; last = ns_now(); continue;
+			}
+			/* --clock-source local: slew the emit base onto the WIRED port's counted rate.
+			 * period = elapsed/(frames-1) measured by met_tick on the wire -- the master crystal,
+			 * exact and noise-free. Steps are clamped to 50 ppm per window (sub-cent); once matched
+			 * the meter only refines, so steady-state steps are sub-ppm = a dead-constant cadence.
+			 * While the meter is valid the occupancy PLL above is bypassed: occ is free to swing
+			 * with WDS bursts and NEVER touches the clock -- no recovery warble, no ratchet. */
+			if (g_clock_local) {
+				unsigned long long mn = g_met_n;
+				long long mt0 = g_met_t0, mtl = g_met_tlast;
+				if (mn >= 1000 && mtl - mt0 >= 2000000000LL) {
+					double mper = (double)(mtl - mt0) / (double)(mn - 1);
+					double mpps = 1.0e9 / mper;
+					long mfam = nearest_std_pps(mpps);
+					long efam = nearest_std_pps(1.0e9 / (double)period_ns);
+					double mferr = (mpps >= (double)mfam ? mpps - (double)mfam : (double)mfam - mpps) / (double)mfam;
+					if (mferr < 0.03 && mfam == efam) {
+						double dppm = (mper - base_per) / base_per * 1e6;
+						if (dppm >  50.0) dppm =  50.0;
+						else if (dppm < -50.0) dppm = -50.0;
+						base_per *= (1.0 + dppm * 1e-6);
+						period_ns = (long)(base_per + 0.5);
+						period = base_per * (1.0 - bias_ppm * 1e-6);
+						clk_last_ok = now;
+						clk_act = 1;
+					} else if (mfam != efam) {
+						g_met_reset = 1;   /* meter window straddles a rate change -> re-measure */
+					}
+				}
+				if (clk_act && now - clk_last_ok > 30000000000LL) clk_act = 0;   /* meter lost -> PLL fallback */
 			}
 			live.period_ns = period_ns;   /* keep the live-reconfig view current (PLL/base tracker drift the base) */
 			/* per-port telemetry line */
-			fprintf(stderr, "per=%.0f bias=%+.0fppm", period, bias_ppm);
+			fprintf(stderr, "per=%.1f%s bias=%+.0fppm", period,
+			        g_clock_local ? (clk_act ? " clk=wire" : " clk=acq") : "", bias_ppm);
 			for (int i = 0; i < n_streams; i++) {
 				struct stream *s = &streams[i];
 				unsigned head = s->r_head, tail = __atomic_load_n(&s->r_tail, __ATOMIC_ACQUIRE);
@@ -1365,7 +1473,7 @@ int main(int argc, char **argv) {
 	}
 	/* persist the converged lock on a clean exit so a stop/start (or deploy) restarts already-locked.
 	 * Gated on pll_locked: never persist a pre-convergence period (it would warm-restore a bad rate). */
-	if (g_warm_start && pll_locked && eq_done) lock_save(period_ns);
+	if (g_warm_start && (pll_locked || clk_act) && eq_done) lock_save(period_ns);
 #ifdef HAVE_UBUS
 	if (g_ubus_ctx) ubus_free(g_ubus_ctx);
 #endif
