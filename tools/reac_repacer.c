@@ -73,6 +73,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <math.h>
 #include <signal.h>
 #include <poll.h>
 #include <sys/mman.h>
@@ -83,6 +84,16 @@
 #include <netinet/in.h>
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
+#include <linux/net_tstamp.h>
+#ifndef SO_TXTIME
+#define SO_TXTIME 61
+#endif
+#ifndef CLOCK_TAI
+#define CLOCK_TAI 11
+#endif
+#ifndef SCM_TXTIME
+#define SCM_TXTIME SO_TXTIME
+#endif
 
 #ifdef HAVE_UBUS
 #include <libubus.h>
@@ -120,6 +131,27 @@ static volatile sig_atomic_t reconf_gen = 0;         /* bumped on each staged re
 
 /* global config (identical for every port) */
 static int g_bcast_only, g_bypass, g_ctrl_bypass, g_auto_rate = 1;
+static int g_etf, g_etf_lead_ns = 4000000;   /* --etf: emit via SCM_TXTIME; loose presubmit lead (ns) */
+static long long g_cur_txtime;               /* this tick's ETF txtime (TAI ns); 0 => send immediately */
+static long long g_tai_off;                  /* CLOCK_TAI - CLOCK_MONOTONIC (ns); sch_etf wants TAI */
+
+/* tx: emit one frame on a PACKET socket. With --etf, stamp SCM_TXTIME = g_cur_txtime so the
+ * kernel sch_etf qdisc releases it at exactly that instant (hardware-timer precision, no
+ * SCHED_FIFO wake jitter); otherwise a plain immediate sendto. Returns like sendto. */
+static ssize_t tx(int fd, const void *buf, size_t n, const struct sockaddr_ll *to) {
+	if (!g_etf || !g_cur_txtime)
+		return sendto(fd, buf, n, 0, (const struct sockaddr *)to, sizeof *to);
+	struct iovec iov = { .iov_base = (void *)buf, .iov_len = n };
+	char cbuf[CMSG_SPACE(sizeof(uint64_t))];
+	struct msghdr msg = { .msg_name = (void *)to, .msg_namelen = sizeof *to,
+	                      .msg_iov = &iov, .msg_iovlen = 1,
+	                      .msg_control = cbuf, .msg_controllen = sizeof cbuf };
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+	cm->cmsg_level = SOL_SOCKET; cm->cmsg_type = SCM_TXTIME;
+	cm->cmsg_len = CMSG_LEN(sizeof(uint64_t));
+	uint64_t t = (uint64_t)g_cur_txtime; memcpy(CMSG_DATA(cm), &t, sizeof t);
+	return sendmsg(fd, &msg, 0);
+}
 static int g_forward_only;           /* de-jitter the forward (IN->OUT) only; leave the return
                                       * (OUT->IN) to the kernel bridge -- lossless, no pass-through
                                       * thread to starve. Used on the mixer side, where the
@@ -258,21 +290,96 @@ static long long ns_now(void) {
  * the exact rate the emit needs: rate exact -> occupancy holds -> the occupancy-chasing
  * loops (servo/tracker/PLL recovery) are bypassed entirely and never modulate the
  * cadence. WiFi carries data, never timing. */
-static int g_clock_local;                       /* --clock-source local */
-static volatile unsigned long long g_met_n;     /* frames counted since window start */
-static volatile long long g_met_t0, g_met_tlast;
-static volatile sig_atomic_t g_met_reset;       /* pacer: family went stale -> re-measure */
+static int g_clock_local, g_clock_in;            /* --clock-source local (OUT wired dev) / local-in (IN = mixer rate) */
+static int g_clock_margin_ppm = 2;              /* --clock-margin-ppm: cumulative-rate change that re-applies the pace */
+/* --inject-sine SLOT:FREQ -- TEST ONLY: overwrite one channel slot of every emitted
+ * audio frame (port 0) with a locally synthesized sine. Isolates the delivery path:
+ * the desk receives a tone that never touched the stagebox A/D or the WiFi. */
+static int g_inj_slot = -1;
+static double g_inj_freq = 440.0, g_inj_ph = 0.0, g_inj_amp = 1.0e6;   /* ~-18 dBFS */
+/* --inject-copy SRC:DST -- TEST ONLY: relay the DOWNSTREAM's slot SRC samples (the
+ * desk's own oscillator, arriving wired on the OUT port) into the upstream slot DST.
+ * A digital loopback of the desk's pristine samples through our delivery path: no
+ * synthesis, no A/D, no WiFi in the audio. */
+static int g_cp_src = -1, g_cp_dst = -1;
+static int g_pace_ds;   /* --pace-by-downstream: emit each upstream frame as a timed RESPONSE to a
+                         * downstream frame arriving on the wired OUT port -- a real stagebox is a
+                         * synchronous TDM slave (measured: box answers 69 us +/- 25 after each
+                         * downstream frame; our free-running emit smeared phase across the whole
+                         * period and the desk garbled it). The desk's own cable provides rate AND
+                         * phase by construction; the ring is purely a WDS jitter absorber. */
+#define CPR_SZ 16384
+static int32_t g_cpr[CPR_SZ];
+static volatile unsigned g_cpr_w, g_cpr_r;
 
-static void met_tick(long long *t_prev) {
-	long long t = ns_now();
-	if (g_met_reset) { g_met_reset = 0; g_met_n = 0; }
-	if (*t_prev && t - *t_prev > 250000000LL) g_met_n = 0;       /* stream gap (relink / rate change) -> fresh window */
-	if (g_met_n && t - g_met_t0 > 600000000000LL) g_met_n = 0;   /* re-baseline ~10 min: track thermal drift, don't average across it */
-	*t_prev = t;
-	if (!g_met_n) g_met_t0 = t;
-	g_met_tlast = t;
-	g_met_n++;                                   /* count written last: a reader's snapshot error is ~1/n */
+static void *inj_copy_rx(void *arg) {
+	struct stream *s = arg; uint8_t buf[SLOT_SZ];
+	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;
+	while (running) {
+		struct sockaddr_ll from; socklen_t fl = sizeof from;
+		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+		if (n < 50) continue;
+		if (from.sll_pkttype == PACKET_OUTGOING) continue;
+		uint8_t *r = buf; int len = (int)n;
+		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && r[16] == 0x88 && r[17] == 0x19) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
+		if (!(r[12] == 0x88 && r[13] == 0x19) || !(r[16] == 0 && r[17] == 0)) continue;
+		int nch = (len - 50) / 36; if (nch < 1 || g_cp_src >= nch) continue;
+		uint8_t *a = r + 50; int base = (g_cp_src & ~1) * 3;
+		for (int s2 = 0; s2 < 12; s2++) {
+			uint8_t *sp = a + base + s2 * (nch * 3);
+			uint8_t b0, b1, b2;
+			if (g_cp_src & 1) { b0 = sp[4]; b1 = sp[5]; b2 = sp[2]; }
+			else              { b0 = sp[3]; b1 = sp[0]; b2 = sp[1]; }
+			int32_t v = b0 | (b1 << 8) | (b2 << 16); if (v & 0x800000) v -= (1 << 24);
+			unsigned w = g_cpr_w;
+			g_cpr[w & (CPR_SZ - 1)] = v;
+			__atomic_store_n(&g_cpr_w, w + 1, __ATOMIC_RELEASE);
+		}
+	}
+	return NULL;
 }
+
+static void inj_copy(uint8_t *f, int len) {
+	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;
+	int nch = (len - 50) / 36; if (nch < 1 || g_cp_dst >= nch) return;
+	uint8_t *a = f + 50; int base = (g_cp_dst & ~1) * 3;
+	static int32_t last;
+	static int primed;
+	unsigned w0 = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
+	if (!primed) {                      /* let the reader get ~21 ms ahead before the first pop,
+	                                     * so thread-scheduling jitter never empties the ring */
+		if (w0 - g_cpr_r < 2048) return;
+		g_cpr_r = w0 - 2048; primed = 1;
+	}
+	for (int s2 = 0; s2 < 12; s2++) {
+		unsigned w = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
+		int32_t v = last;
+		if (w != g_cpr_r) { v = g_cpr[g_cpr_r & (CPR_SZ - 1)]; g_cpr_r++; last = v; }
+		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
+		uint8_t *sp = a + base + s2 * (nch * 3);
+		if (g_cp_dst & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
+		else              { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+	}
+}
+
+static void inj_sine(uint8_t *f, int len) {
+	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;          /* audio frames only */
+	int nch = (len - 50) / 36; if (nch < 1) return;
+	if (g_inj_slot >= nch) return;
+	uint8_t *a = f + 50;
+	int base = (g_inj_slot & ~1) * 3;
+	for (int s2 = 0; s2 < 12; s2++) {
+		int32_t v = (int32_t)(g_inj_amp * sin(g_inj_ph));
+		g_inj_ph += 2.0 * M_PI * g_inj_freq / 96000.0;
+		if (g_inj_ph > 2.0 * M_PI) g_inj_ph -= 2.0 * M_PI;
+		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
+		uint8_t *sp = a + base + s2 * (nch * 3);
+		if (g_inj_slot & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
+		else                { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+	}
+}
+static volatile unsigned long long g_met_n;     /* driver-level rx_packets of the OUT iface */
+static volatile long long g_met_tlast;          /* when that count was read */
 
 static int open_iface(const char *name, struct iface *o) {
 	int s = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -286,6 +393,7 @@ static int open_iface(const char *name, struct iface *o) {
 	int rcv = 32 * 1024 * 1024;   /* burst headroom: 43 ms WDS bursts must not overflow the reader's socket */
 	if (setsockopt(s, SOL_SOCKET, SO_RCVBUFFORCE, &rcv, sizeof rcv) < 0) setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcv, sizeof rcv);
 	if (g_bypass) { int one = 1; setsockopt(s, SOL_PACKET, PACKET_QDISC_BYPASS, &one, sizeof one); }
+	if (g_etf) { struct sock_txtime st = { .clockid = CLOCK_TAI, .flags = 0 }; setsockopt(s, SOL_SOCKET, SO_TXTIME, &st, sizeof st); }
 	o->fd = s; o->ifindex = ifr.ifr_ifindex;
 	memset(&o->tx, 0, sizeof o->tx);
 	o->tx.sll_family = AF_PACKET; o->tx.sll_ifindex = ifr.ifr_ifindex; o->tx.sll_halen = 6;
@@ -337,34 +445,111 @@ static void *fwd_rx(void *arg) {
 /* return relay: stagebox -> tunnel, immediate (master tolerates input jitter) */
 static void *ret_relay(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
-	long long met_prev = 0;
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
 		if (n < 14) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* never echo the master back -> no loop */
 		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;        /* REAC frames (incl handshake) */
-		if (g_clock_local && s == &streams[0]) met_tick(&met_prev);  /* wired-clock meter rides the relay */
 		if (sendto(s->IN.fd, buf, (size_t)n, 0, (struct sockaddr *)&s->IN.tx, sizeof s->IN.tx) < 0) s->n_reterr++;
 		else s->n_ret++;
 	}
 	return NULL;
 }
 
-/* wired-clock meter thread (--clock-source local, --forward-only): the return path is
- * the kernel bridge's, so nothing else reads OUT's socket -- this thread drains it and
- * counts the local wired device's REAC frames. The count IS the master clock. */
+static int g_meter_cpu = -1;   /* core for the meter -- OFF the pacer's RT core */
 static void *clk_meter(void *arg) {
+	/* Count the wired device's REAC FRAME COUNTER (bytes 14-15), drop-immune. CRITICAL:
+	 * this must NOT read-while-the-pacer-loops on the same core (a busy socket read steals
+	 * scheduling from the SCHED_FIFO emit -> cadence jitter). So: own socket with a TINY
+	 * rcvbuf, pinned OFF the pacer core, drained to the NEWEST counter then SLEEP 250 ms.
+	 * A few hundred reads/s off-core, not 16k/s on-core. Drops don't matter -- the counter
+	 * advances regardless, so newest-counter / elapsed is the device's exact rate. */
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
-	long long t_prev = 0;
-	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;   /* flush backlog */
+	if (g_meter_cpu >= 0) { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(g_meter_cpu, &cs); sched_setaffinity(0, sizeof cs, &cs); }
+	int fd = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+	if (fd < 0) return NULL;
+	struct sockaddr_ll sll; memset(&sll, 0, sizeof sll);
+	sll.sll_family = AF_PACKET; sll.sll_protocol = htons(ETH_P_ALL); sll.sll_ifindex = g_clock_in ? s->IN.ifindex : s->OUT.ifindex;
+	if (bind(fd, (struct sockaddr *)&sll, sizeof sll) < 0) { close(fd); return NULL; }
+	int rb = 128 * 1024;   /* tiny: we only need the newest counter, the rest can drop */
+	setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rb, sizeof rb);
+	unsigned long long cum = 0; uint16_t lastc = 0; int have = 0;
+	while (running) {
+		struct timespec ts = { 0, 250000000 };                    /* 250 ms between samples, off-core */
+		nanosleep(&ts, NULL);
+		struct sockaddr_ll from; socklen_t fl;
+		for (;;) { fl = sizeof from; if (recvfrom(fd, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl) <= 0) break; }   /* discard stale backlog */
+		int got = 0;                                              /* then BLOCK for one FRESH frame -> (counter,time) is current */
+		while (running && !got) {
+			fl = sizeof from;
+			ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
+			if (n <= 0) break;
+			if (from.sll_pkttype == PACKET_OUTGOING) continue;
+			int eo = (n > 13 && buf[12] == 0x81 && buf[13] == 0x00) ? 16 : 12;
+			if (n < eo + 6 || !(buf[eo] == 0x88 && buf[eo + 1] == 0x19) || n < 1000) continue;
+			uint16_t c = buf[eo + 2] | (buf[eo + 3] << 8);
+			if (have) cum += (uint16_t)(c - lastc);
+			lastc = c; have = 1; g_met_n = cum; g_met_tlast = ns_now();
+			got = 1;
+		}
+	}
+	close(fd); return NULL;
+}
+/* one emission with pace_one's exact semantics (counter restamp, mute, inject, PLC) */
+static void ds_emit_one(struct stream *s) __attribute__((unused));
+static void ds_emit_one(struct stream *s) {
+	unsigned head = s->r_head, tail = __atomic_load_n(&s->r_tail, __ATOMIC_ACQUIRE);
+	int occ = (int)((tail - head) & RING_MASK);
+	if (occ <= 0) {
+		s->n_underrun++;
+		if (s->have_last) {
+			memcpy(s->plc_buf, s->slot_buf[s->last_idx], s->slot_len[s->last_idx]);
+			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
+			if (g_mute_until && ns_now() < g_mute_until && s->plc_buf[16] == 0 && s->plc_buf[17] == 0 && s->slot_len[s->last_idx] > 18)
+				memset(s->plc_buf + 18, 0, s->slot_len[s->last_idx] - 18);
+			if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(s->plc_buf, s->slot_len[s->last_idx]);
+			if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(s->plc_buf, s->slot_len[s->last_idx]);
+			if (tx(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], &s->OUT.tx) < 0) s->n_txerr++;
+			else s->n_plc++;
+			s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
+		}
+		return;
+	}
+	uint8_t *f = s->slot_buf[head];
+	if (!s->have_last) s->emit_ctr = f[14] | (f[15] << 8);
+	f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;
+	if (g_mute_until && ns_now() < g_mute_until && f[16] == 0 && f[17] == 0 && s->slot_len[head] > 18)
+		memset(f + 18, 0, s->slot_len[head] - 18);
+	if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(f, s->slot_len[head]);
+	if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(f, s->slot_len[head]);
+	if (tx(s->OUT.fd, f, s->slot_len[head], &s->OUT.tx) < 0) s->n_txerr++;
+	s->last_idx = (int)head; s->have_last = 1;
+	__atomic_store_n(&s->r_head, (head + 1) & RING_MASK, __ATOMIC_RELEASE); s->n_tx++;
+	s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
+}
+
+static int g_ds_cpu = -1;            /* pin the slot-grid listener to the RT core (set from --cpu) */
+static volatile long long g_ds_tns;  /* arrival time of the latest downstream frame (the desk's slot grid) */
+/* slot-grid listener: pure trigger-emission was tried and REJECTED on the rig -- it
+ * phase-locks but adds ~38 us of per-frame cadence jitter (recvfrom scheduling), and
+ * the desk needs BOTH smooth cadence and slot phase. So this thread only TIMESTAMPS
+ * the desk's downstream frames; the timed pacer keeps its glacial cadence and steers
+ * its deadline PHASE slowly (ns per tick, heavily filtered) onto the grid. */
+static void *ds_pacer(void *arg) {
+	struct stream *s = arg; uint8_t buf[SLOT_SZ];
+	struct sched_param prm; prm.sched_priority = 79;
+	pthread_setschedparam(pthread_self(), SCHED_FIFO, &prm);
+	if (g_ds_cpu >= 0) { cpu_set_t cs; CPU_ZERO(&cs); CPU_SET(g_ds_cpu, &cs); sched_setaffinity(0, sizeof cs, &cs); }
+	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-		if (n < 14) continue;
-		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* our own emit is not the reference */
-		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;
-		met_tick(&t_prev);
+		if (n < 18) continue;
+		if (from.sll_pkttype == PACKET_OUTGOING) continue;
+		if (!((buf[12] == 0x88 && buf[13] == 0x19) ||
+		      (buf[12] == 0x81 && buf[13] == 0x00 && buf[16] == 0x88 && buf[17] == 0x19))) continue;
+		g_ds_tns = ns_now();
 	}
 	return NULL;
 }
@@ -458,6 +643,11 @@ static void stream_resize(struct stream *s, long period_ns, int prefill) {
 	s->prefill = prefill;
 	s->occ_ema = (double)prefill;
 	s->started = 0;          /* re-arm per-port activation (prefill before emitting) */
+	if (g_clock_local) {     /* local mode: idle at prefill = the max-latency budget; absorb bursts up to 2x */
+		s->occ_cap = prefill * 2;
+		if (s->occ_cap > RING_SZ - 64) s->occ_cap = RING_SZ - 64;
+		if (s->occ_cap < 8) s->occ_cap = 8;
+	}
 }
 
 /* one port's emit for this tick. The frozen shared clock owns the cadence; here we
@@ -501,7 +691,9 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
 			if (g_mute_until && ns_now() < g_mute_until && s->plc_buf[16] == 0 && s->plc_buf[17] == 0 && s->slot_len[s->last_idx] > 18)
 				memset(s->plc_buf + 18, 0, s->slot_len[s->last_idx] - 18);
-			if (sendto(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], 0, (struct sockaddr *)&s->OUT.tx, sizeof s->OUT.tx) < 0) s->n_txerr++;
+			if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(s->plc_buf, s->slot_len[s->last_idx]);
+			if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(s->plc_buf, s->slot_len[s->last_idx]);
+			if (tx(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], &s->OUT.tx) < 0) s->n_txerr++;
 			else s->n_plc++;
 			s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
 		}
@@ -511,7 +703,9 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 		f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;        /* own a monotonic output counter */
 		if (g_mute_until && ns_now() < g_mute_until && f[16] == 0 && f[17] == 0 && s->slot_len[head] > 18)
 			memset(f + 18, 0, s->slot_len[head] - 18);   /* transition mute: silence audio payload, keep link control */
-		if (sendto(s->OUT.fd, f, s->slot_len[head], 0, (struct sockaddr *)&s->OUT.tx, sizeof s->OUT.tx) < 0) s->n_txerr++;
+		if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(f, s->slot_len[head]);
+		if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(f, s->slot_len[head]);
+		if (tx(s->OUT.fd, f, s->slot_len[head], &s->OUT.tx) < 0) s->n_txerr++;
 		s->last_idx = (int)head; s->have_last = 1;
 		__atomic_store_n(&s->r_head, (head + 1) & RING_MASK, __ATOMIC_RELEASE); s->n_tx++;
 		s->emit_ctr = (s->emit_ctr + 1) & 0xFFFF;
@@ -858,9 +1052,14 @@ static void usage(FILE *f) {
 "  --forward-only         de-jitter only the forward (IN->OUT) direction and do not\n"
 "                         run the return pass-through (mixer side; default off)\n"
 "  --bcast-only           accept only the master broadcast frames (default off)\n"
-"  --clock-source S       emit clock reference: wifi (occupancy PLL, default) or local\n"
+"  --clock-source S       emit clock: wifi (occ PLL, default), local (OUT wired dev rate), local-in (IN/mixer rate)\n"
 "                         (count frames on the wired OUT port = the master crystal,\n"
 "                         exact; WiFi then carries data, never timing)\n"
+"  --pace-by-downstream   emit each upstream frame as a response to a downstream frame\n"
+"                         arriving on the wired OUT port (synchronous TDM, like a real\n"
+"                         stagebox: the desk provides rate AND phase)\n"
+"  --clock-margin-ms N    local mode: buffer movement (ms) that triggers a clock\n"
+"                         re-derive from the cumulative count (default 3)\n"
 "  --cpu N                core to pin the real-time pacing thread to (default 3)\n"
 "\n"
 "Warm-start state:\n"
@@ -896,6 +1095,8 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--period-ns") && i + 1 < argc) { period_ns = atol(argv[++i]); g_auto_rate = 0; }
 		else if (!strcmp(argv[i], "--cpu") && i + 1 < argc) cpu = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--detect-ms") && i + 1 < argc) g_detect_ms = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--etf")) { g_etf = 1; g_bypass = 0; }
+		else if (!strcmp(argv[i], "--etf-lead-ms") && i + 1 < argc) g_etf_lead_ns = atoi(argv[++i]) * 1000000;
 		else if (!strcmp(argv[i], "--detect-confirm") && i + 1 < argc) g_detect_confirm = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--mute-ms") && i + 1 < argc) g_mute_ms = atoi(argv[++i]);
 		else if (!strcmp(argv[i], "--prio") && i + 1 < argc) prio = atoi(argv[++i]);
@@ -910,7 +1111,11 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--no-plc")) g_plc = 0;
 		else if (!strcmp(argv[i], "--no-auto-rate")) g_auto_rate = 0;
 		else if (!strcmp(argv[i], "--reclaim")) g_reclaim = 1;
-		else if (!strcmp(argv[i], "--clock-source") && i + 1 < argc) g_clock_local = !strcmp(argv[++i], "local");
+		else if (!strcmp(argv[i], "--clock-source") && i + 1 < argc) { const char *cs = argv[++i]; g_clock_local = (!strcmp(cs, "local") || !strcmp(cs, "local-in")); g_clock_in = !strcmp(cs, "local-in"); }
+		else if (!strcmp(argv[i], "--clock-margin-ppm") && i + 1 < argc) g_clock_margin_ppm = atoi(argv[++i]);
+		else if (!strcmp(argv[i], "--inject-sine") && i + 1 < argc) { char *c = strchr(argv[++i], ':'); g_inj_slot = atoi(argv[i]); if (c) g_inj_freq = atof(c + 1); }
+		else if (!strcmp(argv[i], "--inject-copy") && i + 1 < argc) { char *c = strchr(argv[++i], ':'); g_cp_src = atoi(argv[i]); if (c) g_cp_dst = atoi(c + 1); }
+		else if (!strcmp(argv[i], "--pace-by-downstream")) g_pace_ds = 1;
 		else if (!strcmp(argv[i], "--pll")) g_pll = 1;
 		else if (!strcmp(argv[i], "--pll-fgain") && i + 1 < argc) g_pll_fgain = atof(argv[++i]);
 		else if (!strcmp(argv[i], "--pll-pos-min")) g_pll_pos_min = 1;
@@ -951,7 +1156,12 @@ int main(int argc, char **argv) {
 		s->slot_buf = calloc(RING_SZ, SLOT_SZ);
 		s->slot_len = calloc(RING_SZ, sizeof(uint16_t));
 		if (!s->slot_buf || !s->slot_len) { perror("calloc"); return 1; }
-		s->occ_cap = RING_SZ - 64;        /* runaway safety only */
+		s->occ_cap = RING_SZ - 64;        /* runaway safety only (wifi mode) */
+		if (g_clock_local) {              /* local mode: idle at prefill = the max-latency budget; absorb bursts up to 2x */
+			s->occ_cap = prefill * 2;
+			if (s->occ_cap > RING_SZ - 64) s->occ_cap = RING_SZ - 64;
+			if (s->occ_cap < 8) s->occ_cap = 8;
+		}
 		s->last_in = 0;
 		if (open_iface(s->in_name, &s->IN) || open_iface(s->out_name, &s->OUT)) return 1;
 		stream_resize(s, period_ns, prefill);
@@ -977,8 +1187,16 @@ int main(int argc, char **argv) {
 		pthread_create(&streams[i].rx_th, NULL, fwd_rx, &streams[i]);
 		if (!g_forward_only) pthread_create(&streams[i].ret_th, NULL, ret_relay, &streams[i]);
 	}
-	if (g_clock_local && g_forward_only) {   /* with the return relay running, it counts instead (same fd) */
+	if (g_clock_local) {   /* drop-immune frame-counter meter, OFF the pacer core, drain+sleep */
+		g_meter_cpu = (cpu == 0) ? 1 : 0;
 		pthread_t mt; pthread_create(&mt, NULL, clk_meter, &streams[0]);
+	}
+	if (g_cp_src >= 0 && g_cp_dst >= 0 && !g_pace_ds) {   /* TEST relay (NOT with pace-ds: both would read OUT.fd) */
+		pthread_t ct; pthread_create(&ct, NULL, inj_copy_rx, &streams[0]);
+	}
+	if (g_pace_ds) {   /* one listener on port 0's wired side: the desk's slot grid is common */
+		g_ds_cpu = cpu;
+		pthread_t dt; pthread_create(&dt, NULL, ds_pacer, &streams[0]);
 	}
 
 	/* one RT pacing thread (this one) on a dedicated core, isolated from the NIC IRQ core */
@@ -1145,6 +1363,8 @@ int main(int argc, char **argv) {
 	        eq_floor, (int)((long long)eq_floor * period_ns / 1000000));
 
 	long long deadline = ns_now() + period_ns; double period = (double)period_ns;
+	if (g_etf) { struct timespec ta, tm; clock_gettime(CLOCK_TAI, &ta); clock_gettime(CLOCK_MONOTONIC, &tm);
+	            g_tai_off = (ta.tv_sec - tm.tv_sec) * 1000000000LL + (ta.tv_nsec - tm.tv_nsec); }
 	long long last = ns_now();
 	/* wired-clock state (--clock-source local): base_per is the emit base period as a DOUBLE
 	 * (sub-ns rate resolution: 1 ns of period at 96 k is 8 ppm -- integer ns alone quantizes the
@@ -1153,7 +1373,17 @@ int main(int argc, char **argv) {
 	 * occupancy-chasing PLL below is bypassed (occupancy carries WiFi noise; the wire carries
 	 * the clock). Meter lost > 30 s -> unlatch, PLL resumes (graceful wifi fallback). */
 	double base_per = (double)period_ns, dl_carry = 0.0;
-	int clk_act = 0; long long clk_last_ok = 0;
+	int clk_act = 0; long long clk_last_ok = g_clock_local ? ns_now() : 0;
+	double ph_ema = 0.0, ph_int = 0.0, ph_freq_adj = 0.0;   /* slot-grid PI phase PLL state (--pace-by-downstream) */
+	long lock_saved_per = 0;
+	/* wired-meter state: cumulative anchor (frame #1 of the current continuous stream) and
+	 * an online (Welford) fit over EVERY 1 Hz (count, time) observation since it -- still
+	 * "total frames / elapsed time since frame #1", but using all the evidence: a single
+	 * endpoint's ~ms read jitter swings a 2-point estimate by tens of ppm for minutes,
+	 * while the all-samples fit kills it as T*sqrt(N). The window only grows. */
+	unsigned long long met_n0 = 0, met_prev_n = 0;
+	long long met_t0 = 0, met_prev_t = 0, met_prev_y = 0;
+	double met_mx = 0, met_my = 0, met_c = 0, met_m2 = 0; long long met_ns = 0, met_age = 0;
 	/* drain servo: bias the one shared clock a few hundred ppm to steer the TIGHTEST active
 	 * port's smoothed occupancy onto its (adaptive) target -- fast to drain excess latency,
 	 * slow to fill, gated on the tightest port so none underruns. A steady, slowly-ramped
@@ -1193,12 +1423,15 @@ int main(int argc, char **argv) {
 	int applied_gen = reconf_gen;
 
 	while (running) {
-		struct timespec d = { deadline / 1000000000LL, deadline % 1000000000LL };
+		long long wake = g_etf ? deadline - g_etf_lead_ns : deadline;   /* ETF: wake loose, kernel times the egress */
+		struct timespec d = { wake / 1000000000LL, wake % 1000000000LL };
 		clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &d, NULL);
+		g_cur_txtime = g_etf ? deadline + g_tai_off : 0;
 
 		/* emit every port on this shared tick. Pre eq_done shallow ports DEFER to the common
 		 * floor; post eq_done a late/idle hot-joiner gates on the peers' live running depth so it
 		 * joins delay-matched. With --servo-clamp-ppm 0 shtgt stays == prefill. */
+		long long now_pll = ns_now();
 		int join_depth = (int)(shtgt + SERVO_SETPOINT + 0.5);
 		for (int i = 0; i < n_streams; i++) {
 			int active = 0;
@@ -1294,7 +1527,16 @@ int main(int argc, char **argv) {
 		 * error (drift / elapsed ticks), clamped to PLL_MAXPPM so even the rare correction is inaudible.
 		 * Steady mode runs this even without --pll (it IS steady mode's occupancy trim); short-term WDS
 		 * bursts show as occupancy swings on occ_ema that stay inside the band and never reach the rate. */
-		if (!clk_act && (g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
+		/* wire-clock mode: the occupancy PLL is OFF the moment the meter is alive (acquiring
+		 * OR latched) -- two correctors on one period beat against each other (a trim every
+		 * ~4 s PLL window = a beep at constant pace). It returns only as the >30 s-dead
+		 * meter fallback. */
+		/* once the wire rate is SET, nothing else ever touches the clock again -- a
+		 * quiet meter means FREE-RUN on the last set value (near-exact; the margin
+		 * re-derive picks up when the meter returns). The PLL exists only as the
+		 * never-acquired fallback (no REAC on the wire within 30 s of start). */
+		int clk_alive = g_clock_local && (clk_act || (clk_last_ok && now_pll - clk_last_ok < 30000000000LL));
+		if (!clk_alive && (g_pll || g_steady) && eq_done && have && ++pll_div >= PLL_WIN) {
 			double msum = 0; int mc = 0;
 			for (int i = 0; i < n_streams; i++)
 				if (streams[i].started && streams[i].n_rx) { msum += streams[i].occ_ema; mc++; }
@@ -1340,7 +1582,7 @@ int main(int argc, char **argv) {
 		 * ever persist a CONVERGED period (never a pre-lock transient), plus eq_done + no in-flight depth
 		 * walk; the file write is off the jitter-critical emit. */
 		if (g_warm_start && (pll_locked || clk_act) && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
-			lock_save(period_ns);
+			if (period_ns != lock_saved_per) { lock_save(period_ns); lock_saved_per = period_ns; }   /* flash write on the RT thread: only when changed */
 			lock_div = 0;
 		}
 		/* glitch-free occupancy retarget: while a depth change is walking in, bias THIS tick's
@@ -1354,8 +1596,29 @@ int main(int argc, char **argv) {
 			retarget_ticks--;
 			if (retarget_ticks == 0) retarget_ppm = 0.0;
 		}
+		emit_period *= (1.0 + ph_freq_adj * 1e-6);    /* slot-phase PLL: smooth freq trim, NOT a per-tick jump */
 		dl_carry += emit_period;                       /* fractional-ns accumulation: cadence = emit_period exactly */
 		{ long long dstep = (long long)dl_carry; dl_carry -= (double)dstep; deadline += dstep; }
+		/* slot-grid phase PLL (--pace-by-downstream): drive the emit phase onto the master's
+		 * downstream slot + the ~69 us box-like answer offset. The phase error (folded into one
+		 * slot) is heavily EMA-filtered to reject the per-frame grid-timestamp jitter, then fed
+		 * as a small PROPORTIONAL FREQUENCY trim (ppm) -- NOT a per-tick position jump, so the
+		 * cadence stays smooth (no granular). Kp gives a ~2 s walk like the real box's tracking
+		 * ramp; rate is already locked by the counter clock, so no integral term is needed. */
+		if (g_pace_ds) {
+			long long dst = g_ds_tns;
+			if (dst) {
+				double per2 = period;
+				double ph = fmod((double)(deadline - (dst + 69000)), per2);
+				if (ph < 0) ph += per2;
+				if (ph > per2 / 2) ph -= per2;
+				ph_ema += (ph - ph_ema) * 0.0015;          /* slow filter: reject grid jitter */
+				ph_int += ph_ema;                          /* integral: nulls the residual FREQ error (= the beat) */
+				if (ph_int >  4.0e9) ph_int =  4.0e9; else if (ph_int < -4.0e9) ph_int = -4.0e9;   /* anti-windup */
+				ph_freq_adj = -(ph_ema * 5.0e-4 + ph_int * 1.0e-8);   /* PI: Kp ~2 s walk, Ki nulls drift (~10 s) */
+				if (ph_freq_adj > 40.0) ph_freq_adj = 40.0; else if (ph_freq_adj < -40.0) ph_freq_adj = -40.0;
+			}
+		}
 		long long now = ns_now();
 		if (now - last > (long long)g_detect_ms * 1000000LL) {
 			/* continuous rate detection: a SAMPLE-RATE change shifts the busiest port's input
@@ -1374,7 +1637,7 @@ int main(int argc, char **argv) {
 			if (rate_chg >= g_detect_confirm) {   /* a standard rate sustained the detect window -> a real (rare) change */
 				rate_chg = 0; period_ns = (long)(1.0e9 / in_pps + 0.5); period = (double)period_ns;  /* emit at the MEASURED rate of the new family (cand only DETECTS the change) */
 				base_per = (double)period_ns; dl_carry = 0.0;
-				clk_act = 0; g_met_reset = 1;   /* wired meter: stale family -> re-measure at the new rate */
+				clk_act = 0; met_n0 = 0; met_ns = 0; met_mx = met_my = met_c = met_m2 = 0;   /* wired meter: re-anchor at the new rate */
 				prefill = (int)((long long)prefill_ms * 1000000 / period_ns);
 				if (prefill < 1) prefill = 1;
 				if (prefill > RING_SZ - 65) prefill = RING_SZ - 65;   /* clamp to occ_cap-1 (rx drops at occ_cap) so the prefill barrier is always satisfiable */
@@ -1432,28 +1695,62 @@ int main(int argc, char **argv) {
 			 * While the meter is valid the occupancy PLL above is bypassed: occ is free to swing
 			 * with WDS bursts and NEVER touches the clock -- no recovery warble, no ratchet. */
 			if (g_clock_local) {
-				unsigned long long mn = g_met_n;
-				long long mt0 = g_met_t0, mtl = g_met_tlast;
-				if (mn >= 1000 && mtl - mt0 >= 2000000000LL) {
-					double mper = (double)(mtl - mt0) / (double)(mn - 1);
-					double mpps = 1.0e9 / mper;
-					long mfam = nearest_std_pps(mpps);
+				/* THE clock calculation (operator-settled): period = elapsed time / total
+				 * frames, CUMULATIVE since the anchor frame, count from the driver's
+				 * lossless rx_packets. The window only grows, so precision improves ~1/T
+				 * without bound -- impossible to drift after a few thousand frames. The
+				 * anchor resets only on a real discontinuity (iface reset, stream stall,
+				 * sample-rate change). */
+				int fresh = 0;
+				if (now - met_prev_t >= 1000000000LL) {
+					unsigned long long mn = g_met_n; long long mtl = g_met_tlast;
+					if (mn < met_prev_n || (met_prev_n && mn - met_prev_n < 100)) { met_n0 = 0; met_ns = 0; met_mx = met_my = met_c = met_m2 = 0; }   /* discontinuity -> re-anchor */
+					if (mn >= 2 && mtl != met_prev_y) {
+						if (!met_n0) { met_n0 = mn; met_t0 = mtl; }
+						double x = (double)(mn - met_n0), y = (double)(mtl - met_t0);
+						met_ns++;
+						double dx = x - met_mx;
+						met_mx += dx / (double)met_ns;
+						met_my += (y - met_my) / (double)met_ns;
+						met_c  += dx * (y - met_my);
+						met_m2 += dx * (x - met_mx);
+						met_age = mtl - met_t0; met_prev_y = mtl;
+						fresh = 1;
+					}
+					met_prev_n = mn; met_prev_t = now;
+				}
+				if (fresh && met_n0 && met_ns >= 8 && met_m2 > 0) {
+					double slope = met_c / met_m2;   /* ns per frame, fitted over all samples since the anchor */
+					long long age = met_age;
+					double spps = 1.0e9 / slope;
+					long mfam = nearest_std_pps(spps);
 					long efam = nearest_std_pps(1.0e9 / (double)period_ns);
-					double mferr = (mpps >= (double)mfam ? mpps - (double)mfam : (double)mfam - mpps) / (double)mfam;
+					double mferr = (spps >= (double)mfam ? spps - (double)mfam : (double)mfam - spps) / (double)mfam;
 					if (mferr < 0.03 && mfam == efam) {
-						double dppm = (mper - base_per) / base_per * 1e6;
-						if (dppm >  50.0) dppm =  50.0;
-						else if (dppm < -50.0) dppm = -50.0;
-						base_per *= (1.0 + dppm * 1e-6);
+						/* THE PACE IS frames/time, NOTHING ELSE. base_per = the cumulative slope
+						 * (total frame-counter delta / elapsed since the anchor). The trigger to
+						 * RE-APPLY is ALSO frames/time: only when the cumulative estimate itself
+						 * moves past a small ppm margin (it barely does -- cumulative converges as
+						 * 1/N). Jitter-buffer occupancy is NEVER an input or trigger to the clock;
+						 * occupancy drives ONLY ring depth. (Operator-pinned: no queue in the pace.) */
+						double dppm = (slope - base_per) / base_per * 1e6;
+						if (!clk_act) {
+							base_per = slope;   /* converging: track the cumulative estimate */
+							if (age >= 30000000000LL && dppm < (double)g_clock_margin_ppm && dppm > -(double)g_clock_margin_ppm) {
+								clk_act = 1;
+								fprintf(stderr, "clock: wire rate locked, period=%.2f ns (%.2f pps), holding\n", base_per, 1.0e9 / base_per);
+							}
+						} else if (dppm > (double)g_clock_margin_ppm || dppm < -(double)g_clock_margin_ppm) {
+							fprintf(stderr, "clock: cumulative rate moved %.2f ppm, re-applied %.2f -> %.2f ns\n", dppm, base_per, slope);
+							base_per = slope;
+						}
 						period_ns = (long)(base_per + 0.5);
 						period = base_per * (1.0 - bias_ppm * 1e-6);
 						clk_last_ok = now;
-						clk_act = 1;
 					} else if (mfam != efam) {
-						g_met_reset = 1;   /* meter window straddles a rate change -> re-measure */
+						met_n0 = 0; met_ns = 0; met_mx = met_my = met_c = met_m2 = 0;   /* rate changed -> re-anchor */
 					}
 				}
-				if (clk_act && now - clk_last_ok > 30000000000LL) clk_act = 0;   /* meter lost -> PLL fallback */
 			}
 			live.period_ns = period_ns;   /* keep the live-reconfig view current (PLL/base tracker drift the base) */
 			/* per-port telemetry line */
