@@ -18,7 +18,10 @@ define Package/reac-repacer
   SECTION:=sound
   CATEGORY:=Sound
   TITLE:=REAC Wi-Fi de-jitter re-pacer
-  URL:=https://github.com/linuxnow/reac-aes67
+  URL:=https://github.com/FreeREAC/reac-repacer
+  # reac-transport is a RUNTIME pairing (install both), not a package dep — they are
+  # separate repos with independent builds, so coupling them via DEPENDS would break
+  # standalone builds. The recipe in reac-docs says to install reac-transport too.
   DEPENDS:=+kmod-sched-core +tc-full +ip-full +libubus +libblobmsg-json
 endef
 
@@ -58,9 +61,18 @@ define Package/reac-repacer/install
 	$(INSTALL_CONF) ./files/reac-repacer.config $(1)/etc/config/reac-repacer
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./files/reac-repacer.init $(1)/etc/init.d/reac-repacer
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/97-reac-role $(1)/etc/uci-defaults/97-reac-role
 	$(INSTALL_DIR) $(1)/usr/share/man/man8
 	gzip -9nc ./files/reac-repacer.8 > $(PKG_BUILD_DIR)/reac-repacer.8.gz
 	$(INSTALL_DATA) $(PKG_BUILD_DIR)/reac-repacer.8.gz $(1)/usr/share/man/man8/reac-repacer.8.gz
+endef
+
+define Package/reac-repacer/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/reac-repacer enable
+exit 0
 endef
 
 $(eval $(call BuildPackage,reac-repacer))

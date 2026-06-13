@@ -1,0 +1,51 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
+#
+# Fill reac-rig.repacer.* DIRECTIONAL role profile from the box's WDS wireless
+# mode at install, so the packaged /etc/config/reac-rig ships free of any baked-in
+# role. The two halves of the rig de-jitter opposite directions and therefore need
+# different daemon flags (ear-validated — see docs/REAC-RIG-PARKED-STATE.md):
+#
+#   AP  / master (desk) side  — upstream de-jitter into the phase-strict M-5000:
+#        clock_source=local  pll=1 pace_by_downstream=1 etf=1 bcast_only=0
+#   STA / box (stage) side    — downstream de-jitter to the PLL-tolerant boxes:
+#        clock_source=local-in pll=0 pace_by_downstream=0 etf=0 bcast_only=1
+#
+# Runs once (uci-defaults). 'role' is the fill marker: if already set (operator
+# customised, or a re-run), leave everything alone. Same fingerprint-free principle
+# as the gretap peer fill.
+. /lib/functions.sh
+
+# Operator/previous run already set the role? leave the whole profile alone.
+[ -n "$(uci -q get reac-repacer.repacer.role)" ] && exit 0
+
+role=""
+find_role() {
+	local mode
+	config_get mode "$1" mode
+	case "$mode" in
+		sta) role="sta" ;;
+		ap)  [ -z "$role" ] && role="ap" ;;
+	esac
+}
+config_load wireless
+config_foreach find_role wifi-iface
+
+set_profile() {
+	uci -q set reac-repacer.repacer.role="$1"
+	uci -q set reac-repacer.repacer.clock_source="$2"
+	uci -q set reac-repacer.repacer.pll="$3"
+	uci -q set reac-repacer.repacer.pace_by_downstream="$4"
+	uci -q set reac-repacer.repacer.etf="$5"
+	uci -q set reac-repacer.repacer.bcast_only="$6"
+	uci -q commit reac-repacer
+}
+
+case "$role" in
+	#                 role  clock     pll pace etf bcast
+	ap)  set_profile  ap    local     1   1    1   0 ;;
+	sta) set_profile  sta   local-in  0   0    0   1 ;;
+	*)   echo "reac: no ap/sta wifi-iface found, leaving role profile at AP default" >&2 ;;
+esac
+exit 0
