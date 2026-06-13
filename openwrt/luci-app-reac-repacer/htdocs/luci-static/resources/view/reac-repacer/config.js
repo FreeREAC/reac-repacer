@@ -4,24 +4,28 @@
 'use strict';
 'require view';
 'require form';
-'require uci';
 
 // Config view for the multiport REAC de-jitter re-pacer.
-// Bound 1:1 to /etc/config/reac-repacer; Save&Apply writes UCI and reloads the
-// service (LuCI apply + the procd reload trigger). One daemon, global settings
-// plus one 'port' section per REAC zone.
+// Bound 1:1 to /etc/config/reac-repacer (section 'main', type 'repacer') — the
+// same section the init reads to launch the daemon and the daemon re-reads on
+// SIGHUP. Save & Apply writes UCI and the procd reload trigger relaunches the
+// daemon; the hot params (target buffer, latency-reclaim rate) also retune the
+// running daemon live, without a restart.
+//
+// Every option here maps 1:1 to a key the init's build_args/setup_etf reads
+// (config_get ... main ...). The directional profile (clock source, PLL, ETF, …)
+// is auto-filled per AP/STA at install by /etc/uci-defaults/97-reac-role; it is
+// exposed here under Advanced for manual override only.
 return view.extend({
 	render: function () {
 		let m, s, o;
 
 		m = new form.Map('reac-repacer', _('REAC Wi-Fi Re-pacer'),
 			_('De-jitter Roland REAC streams (EtherType 0x8819) carried over a bursty ' +
-			  'Wi-Fi link. One daemon paces every port on a single shared clock, so the ' +
-			  'stageboxes stay sample-aligned. Latency self-tunes down to the link’s ' +
-			  'clean floor by clock rate alone — frames are never dropped, so reducing ' +
-			  'latency does not click. The sample rate is auto-detected unless pinned.'));
+			  'Wi-Fi / WDS link. One daemon paces every port on a single recovered clock, ' +
+			  'so the stageboxes stay sample-aligned. Pair with the reac-transport package ' +
+			  'for the VLAN trunk + gretap fabric.'));
 
-		// ---- global settings ----
 		s = m.section(form.NamedSection, 'main', 'repacer', _('Service'));
 		s.addremove = false;
 
@@ -29,80 +33,94 @@ return view.extend({
 			_('Master on/off for the whole re-pacer.'));
 		o.rmempty = false;
 
+		o = s.option(form.Value, 'wait_iface', _('Wait for interface'),
+			_('Do not launch until this fabric interface exists (a gretap VLAN ' +
+			  'sub-interface set up by reac-transport).'));
+		o.placeholder = 'reactap.11';
+
 		o = s.option(form.Value, 'prefill_ms', _('Target buffer (ms)'),
-			_('De-jitter buffer depth. The relay sizes the buffer to the observed ' +
-			  'burst depth and drains down toward the clean floor from here. ' +
-			  'Save &amp; Apply retunes the running daemon live (no audio dropout) — ' +
-			  'the latency walks to the new value. For instant by-ear tuning without ' +
-			  'a save, run: ubus call reac_repacer set \'{"prefill_ms":150}\'.'));
+			_('De-jitter buffer depth (ms). The relay sizes the buffer to the observed ' +
+			  'burst and drains toward the clean link floor from here. Save & Apply ' +
+			  'retunes the running daemon live (no dropout). For instant by-ear tuning ' +
+			  'without a save: ubus call reac_repacer set \'{"prefill_ms":150}\'.'));
 		o.datatype = 'range(1,1000)';
-		o.default = '16';
-
-		o = s.option(form.Flag, 'auto_rate', _('Auto rate'),
-			_('Detect the sample rate (44.1 / 48 / 96 kHz) from the wire, at startup ' +
-			  'and live. Turn off to pin it below.'));
-		o.default = '1';
-
-		// "Pin the freq in the website": only applies when auto-detection is off.
-		o = s.option(form.ListValue, 'rate', _('Pinned rate'),
-			_('Sample rate to lock to when auto rate is off.'));
-		o.value('44100', '44.1 kHz');
-		o.value('48000', '48 kHz');
-		o.value('96000', '96 kHz');
-		o.default = '48000';
-		o.depends('auto_rate', '0');
+		o.default = '30';
 
 		o = s.option(form.Value, 'servo_clamp_ppm', _('Latency-reclaim rate (ppm)'),
-			_('Maximum clock bias used to reclaim latency. ~700 ppm (≈1 cent) is ' +
-			  'inaudible; raise for faster latency reduction, lower for a wider ' +
-			  'inaudibility margin.'));
-		o.datatype = 'range(50,3000)';
-		o.default = '700';
+			_('Maximum clock bias used to reclaim latency. 0 freezes the output clock ' +
+			  '(the PLL still trims sub-ppm); raise for faster latency reduction. ' +
+			  '~700 ppm (about 1 cent) is inaudible.'));
+		o.datatype = 'range(0,3000)';
+		o.default = '0';
+
+		o = s.option(form.Value, 'detect_ms', _('REAC detect window (ms)'),
+			_('How long to look for a REAC stream before declaring the port idle.'));
+		o.datatype = 'range(100,10000)';
+		o.default = '2000';
 		o.modalonly = true;
 
-		o = s.option(form.Flag, 'adapt', _('Adaptive buffer'),
-			_('Size the buffer to the observed burst depth: grow at once to cover a ' +
-			  'burst, ease down when the link is calm. Leave on.'));
-		o.default = '1';
+		o = s.option(form.Value, 'clock_margin_ppm', _('PLL lock margin (ppm)'));
+		o.datatype = 'range(0,1000)';
+		o.default = '8';
 		o.modalonly = true;
 
 		o = s.option(form.Value, 'cpu', _('Real-time CPU'),
 			_('CPU core to pin the pacing thread to. Isolate it from the core handling ' +
 			  'the NIC interrupts.'));
 		o.datatype = 'uinteger';
-		o.default = '3';
+		o.default = '2';
+		o.modalonly = true;
+
+		// ---- directional profile: auto-filled per AP/STA by 97-reac-role ----
+		o = s.option(form.ListValue, 'clock_source', _('Clock source'),
+			_('Auto-set from the box Wi-Fi role at install. Override only if you know the ' +
+			  'rig topology.'));
+		o.value('local', _('local — AP / master side'));
+		o.value('local-in', _('local-in — STA / box side'));
+		o.default = 'local';
+		o.modalonly = true;
+
+		o = s.option(form.Flag, 'forward_only', _('Forward only'),
+			_('De-jitter one direction only (the validated relay mode).'));
+		o.default = '1';
 		o.modalonly = true;
 
 		o = s.option(form.Flag, 'bcast_only', _('Broadcast only'),
 			_('De-jitter only the master broadcast (the audio carrier).'));
+		o.default = '0';
+		o.modalonly = true;
+
+		o = s.option(form.Flag, 'pll', _('PLL'),
+			_('Phase-lock the output clock (AP / master side).'));
 		o.default = '1';
 		o.modalonly = true;
 
-		o = s.option(form.Flag, 'unbridge', _('Unbridge ports'),
-			_('Take each port out of the bridge at start. Required: raw L2 transmit is ' +
-			  'dropped by the switch on a VLAN-filtering bridge slave.'));
+		o = s.option(form.Flag, 'pace_by_downstream', _('Pace by downstream'),
+			_('Drive the pacing clock from the downstream port occupancy (AP side).'));
 		o.default = '1';
 		o.modalonly = true;
 
-		// ---- per-port zones ----
-		s = m.section(form.GridSection, 'port', _('REAC ports'),
-			_('One row per REAC zone. A port with no input stays dormant until its ' +
-			  'stream appears, so extra rows are harmless.'));
-		s.addremove = true;
-		s.anonymous = false;
-		s.nodescriptions = true;
-
-		o = s.option(form.Flag, 'enabled', _('On'));
-		o.rmempty = false;
+		o = s.option(form.Flag, 'etf', _('ETF egress (TSN)'),
+			_('Time the egress with the kernel ETF qdisc (SCM_TXTIME) on the stagebox ' +
+			  'ports. HW offload needs an i226-class TSN NIC; otherwise software ETF.'));
 		o.default = '1';
+		o.modalonly = true;
 
-		o = s.option(form.Value, 'in_iface', _('Tunnel iface'),
-			_('Port the bursty master broadcast arrives on (the Wi-Fi/tunnel side).'));
-		o.placeholder = 'reactap.11';
+		o = s.option(form.Value, 'etf_delta_us', _('ETF window (µs)'),
+			_('Default ETF early-release window. A port pair may override it with a third ' +
+			  'IN:OUT:µs field below.'));
+		o.datatype = 'range(10,5000)';
+		o.default = '300';
+		o.depends('etf', '1');
+		o.modalonly = true;
 
-		o = s.option(form.Value, 'out_iface', _('Stagebox iface'),
-			_('Port the clean, re-paced stream is sent to (the local stagebox).'));
-		o.placeholder = 'lan1';
+		// ---- port pairs: 'IN:OUT[:etf_µs]' strings, exactly as the init reads them ----
+		o = s.option(form.DynamicList, 'port', _('REAC port pairs'),
+			_('One entry per REAC zone: IN:OUT (tunnel-side iface : stagebox-side iface), ' +
+			  'optionally IN:OUT:µs to set that port’s ETF window. ' +
+			  'e.g. reactap.11:lan1 or reactap.12:lan2:80. A port with no input stays ' +
+			  'dormant, so extra entries are harmless.'));
+		o.placeholder = 'reactap.11:lan1';
 
 		return m.render();
 	}
