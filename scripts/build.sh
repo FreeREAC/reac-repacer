@@ -2,13 +2,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 #
-# Build the reac-aes67 OpenWrt .apk packages against the LATEST stable OpenWrt
-# release (or a pinned one) in a Fedora container. The apks land in .build/out/.
+# Build the FreeREAC OpenWrt .apk packages present in this repo against the LATEST
+# stable OpenWrt release (or a pinned one) in a Fedora container. Apks land in
+# .build/out/.
 #
-#   ./build/build.sh                           # latest stable, mediatek/filogic (GL-MT6000)
-#   OPENWRT_RELEASE=24.10.2 ./build/build.sh   # pin a release
-#   OPENWRT_TARGET=ramips/mt7621 ./build/build.sh
-#   CONTAINER_ENGINE=docker ./build/build.sh   # use docker instead of podman
+#   ./scripts/build.sh                           # latest stable, mediatek/filogic (GL-MT6000)
+#   OPENWRT_RELEASE=24.10.2 ./scripts/build.sh   # pin a release
+#   OPENWRT_TARGET=ramips/mt7621 ./scripts/build.sh
+#   CONTAINER_ENGINE=docker ./scripts/build.sh   # use docker instead of podman
 #
 # Requires only podman (or docker). The OpenWrt SDK is downloaded once and cached
 # under .build/sdk-cache/ (gitignored). Reproducible: same release+target -> same apks.

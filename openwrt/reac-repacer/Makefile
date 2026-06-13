@@ -39,7 +39,7 @@ define Package/reac-repacer/conffiles
 endef
 
 # The C source is vendored under ./src (populated from the repo's tools/ at
-# build time, like the reac-aes67 recipe).
+# build time).
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
 	$(CP) ./src/reac_repacer.c $(PKG_BUILD_DIR)/
