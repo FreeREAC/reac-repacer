@@ -35,6 +35,9 @@ cd "$SDK_DIR"
 
 echo "== stage packages present in this repo =="
 rm -rf package/reac-* package/luci-app-reac-*
+# Purge stale reac apks from the shared SDK bin/ (the cache persists across repo
+# builds) so out/ only ever holds packages THIS repo produced this run.
+find bin -name '*.apk' -iname '*reac*' -delete 2>/dev/null || true
 PKGS=""
 if [ -d "$REPO/openwrt/reac-aes67" ] && ls "$REPO"/src/*.c >/dev/null 2>&1; then
   mkdir -p package/reac-aes67/src package/reac-aes67/files
@@ -77,5 +80,7 @@ done
 
 echo "== artifacts =="
 mkdir -p "$OUT_DIR"; rm -f "$OUT_DIR"/*.apk
-find bin -name '*.apk' \( -iname '*reac*' -o -iname '*luci-app-reac*' \) -exec cp {} "$OUT_DIR/" \;
+# Copy only the apks for the packages this repo staged + built (scoped to $PKGS),
+# never a blanket reac glob — keeps each repo's release free of cross-repo apks.
+for pkg in $PKGS; do find bin -name "${pkg}-*.apk" -exec cp {} "$OUT_DIR/" \; ; done
 ls -la "$OUT_DIR/"; echo "$REL" > "$OUT_DIR/.openwrt-release"
