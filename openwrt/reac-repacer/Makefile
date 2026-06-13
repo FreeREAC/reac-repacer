@@ -21,7 +21,8 @@ define Package/reac-repacer
   URL:=https://github.com/FreeREAC/reac-repacer
   # reac-transport is a RUNTIME pairing (install both), not a package dep — they are
   # separate repos with independent builds, so coupling them via DEPENDS would break
-  # standalone builds. The recipe in reac-docs says to install reac-transport too.
+  # standalone builds. Install reac-transport alongside this package when the REAC
+  # path crosses Wi-Fi.
   DEPENDS:=+kmod-sched-core +tc-full +ip-full +libubus +libblobmsg-json
 endef
 

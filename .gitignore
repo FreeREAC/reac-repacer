@@ -1,0 +1,2 @@
+# Build harness scratch: cached OpenWrt SDK + built apks (scripts/build.sh).
+/.build/

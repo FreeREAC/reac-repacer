@@ -1,6 +1,6 @@
 {
 	"admin/services/reac-repacer": {
-		"title": "REAC Re-pacer",
+		"title": "REAC Wi-Fi Re-pacer",
 		"order": 61,
 		"action": {
 			"type": "view",
