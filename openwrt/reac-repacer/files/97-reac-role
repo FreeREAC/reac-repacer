@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 #
-# Fill reac-rig.repacer.* DIRECTIONAL role profile from the box's WDS wireless
-# mode at install, so the packaged /etc/config/reac-rig ships free of any baked-in
-# role. The two halves of the rig de-jitter opposite directions and therefore need
-# different daemon flags (ear-validated — see docs/REAC-RIG-PARKED-STATE.md):
+# Fill reac-repacer.main.* DIRECTIONAL role profile from the box's WDS wireless
+# mode at install, so the packaged /etc/config/reac-repacer ships free of any
+# baked-in role. The two halves of the rig de-jitter opposite directions and
+# therefore need different daemon flags (ear-validated):
 #
-#   AP  / master (desk) side  — upstream de-jitter into the phase-strict M-5000:
+#   AP  / master (desk) side  — upstream de-jitter into a phase-strict master:
 #        clock_source=local  pll=1 pace_by_downstream=1 etf=1 bcast_only=0
 #   STA / box (stage) side    — downstream de-jitter to the PLL-tolerant boxes:
 #        clock_source=local-in pll=0 pace_by_downstream=0 etf=0 bcast_only=1
@@ -18,7 +18,7 @@
 . /lib/functions.sh
 
 # Operator/previous run already set the role? leave the whole profile alone.
-[ -n "$(uci -q get reac-repacer.repacer.role)" ] && exit 0
+[ -n "$(uci -q get reac-repacer.main.role)" ] && exit 0
 
 role=""
 find_role() {
@@ -33,12 +33,12 @@ config_load wireless
 config_foreach find_role wifi-iface
 
 set_profile() {
-	uci -q set reac-repacer.repacer.role="$1"
-	uci -q set reac-repacer.repacer.clock_source="$2"
-	uci -q set reac-repacer.repacer.pll="$3"
-	uci -q set reac-repacer.repacer.pace_by_downstream="$4"
-	uci -q set reac-repacer.repacer.etf="$5"
-	uci -q set reac-repacer.repacer.bcast_only="$6"
+	uci -q set reac-repacer.main.role="$1"
+	uci -q set reac-repacer.main.clock_source="$2"
+	uci -q set reac-repacer.main.pll="$3"
+	uci -q set reac-repacer.main.pace_by_downstream="$4"
+	uci -q set reac-repacer.main.etf="$5"
+	uci -q set reac-repacer.main.bcast_only="$6"
 	uci -q commit reac-repacer
 }
 

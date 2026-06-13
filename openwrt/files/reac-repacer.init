@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 #
-# reac-rig — launch the REAC re-pacer once the netifd-owned fabric is up.
+# reac-repacer — launch the REAC re-pacer once the netifd-owned fabric is up.
 #
 # NO fabric setup here: the gretap tunnel, its 8021q VLAN sub-interfaces, their
 # br-lan membership and the L2 return-path nft drop are declarative (see
-# /etc/config/network and /etc/nftables.d/10-reac.nft). This service waits for the
-# fabric iface, installs the per-port ETF qdiscs (AP/master side only), then
-# launches the daemon with the directional (AP/STA) validated flag set from
-# /etc/config/reac-rig.
+# /etc/config/network and /etc/nftables.d/10-reac.nft, provided by reac-transport).
+# This service waits for the fabric iface, installs the per-port ETF qdiscs
+# (AP/master side only), then launches the daemon with the directional (AP/STA)
+# validated flags read from /etc/config/reac-repacer.
 USE_PROCD=1
 START=99
 STOP=10
@@ -20,17 +20,17 @@ ARGS=""
 
 build_args() {
 	local cpu prefill servo margin detect clock fwd bcast pll pace etf
-	config_get      cpu     repacer cpu                2
-	config_get      prefill repacer prefill_ms         30
-	config_get      servo   repacer servo_clamp_ppm    0
-	config_get      margin  repacer clock_margin_ppm   8
-	config_get      detect  repacer detect_ms          2000
-	config_get      clock   repacer clock_source       local
-	config_get_bool fwd     repacer forward_only       1
-	config_get_bool bcast   repacer bcast_only         0
-	config_get_bool pll     repacer pll                1
-	config_get_bool pace    repacer pace_by_downstream 0
-	config_get_bool etf     repacer etf                0
+	config_get      cpu     main cpu                2
+	config_get      prefill main prefill_ms         30
+	config_get      servo   main servo_clamp_ppm    0
+	config_get      margin  main clock_margin_ppm   8
+	config_get      detect  main detect_ms          2000
+	config_get      clock   main clock_source       local
+	config_get_bool fwd     main forward_only       1
+	config_get_bool bcast   main bcast_only         0
+	config_get_bool pll     main pll                1
+	config_get_bool pace    main pace_by_downstream 0
+	config_get_bool etf     main etf                0
 	[ -n "$clock" ] || clock=local
 
 	ARGS=""
@@ -47,11 +47,11 @@ build_args() {
 		local oIFS="$IFS"; IFS=:; set -- $1; IFS="$oIFS"
 		[ -n "$1" ] && [ -n "$2" ] && ARGS="$ARGS --port $1:$2"
 	}
-	config_list_foreach repacer port add_port
+	config_list_foreach main port add_port
 }
 
 wait_for_fabric() {
-	config_get WAIT_IFACE repacer wait_iface reactap.11
+	config_get WAIT_IFACE main wait_iface reactap.11
 	local i=0
 	while [ ! -d "/sys/class/net/$WAIT_IFACE" ]; do
 		i=$((i + 1))
@@ -64,15 +64,15 @@ wait_for_fabric() {
 setup_etf() {
 	# Per-REAC-OUT ETF qdisc so the daemon's --etf (SCM_TXTIME) actually times
 	# egress instead of leaving frames at sendmsg-time with SCHED_FIFO wake jitter
-	# (the phase-strict M-5000 master resamples that into granular audio). AP side
-	# ONLY (etf=1); the STA/box side (etf=0) feeds PLL-tolerant boxes and uses none.
+	# (a phase-strict master resamples that into granular audio). AP side ONLY
+	# (etf=1); the STA/box side (etf=0) feeds PLL-tolerant boxes and uses none.
 	# Per-port window from the port spec's optional :etf_delta_us, else the global
 	# etf_delta_us. Tries HW offload (i226-class TSN = the real fix); falls back to
-	# software (mt7531/mtk GMAC have no offload). See REAC-REPACE-MASTER-CLOCK-LIMIT.md.
+	# software (switch/SoC GMACs without offload).
 	local etf def
-	config_get_bool etf repacer etf 0
+	config_get_bool etf main etf 0
 	[ "$etf" = "1" ] || return 0
-	config_get def repacer etf_delta_us 300
+	config_get def main etf_delta_us 300
 	modprobe sch_etf 2>/dev/null
 	etf_one() {
 		local oIFS="$IFS"; IFS=:; set -- $1; IFS="$oIFS"
@@ -83,16 +83,16 @@ setup_etf() {
 		tc qdisc add dev "$out" root etf clockid CLOCK_TAI delta "$ns" offload 2>/dev/null \
 			|| tc qdisc add dev "$out" root etf clockid CLOCK_TAI delta "$ns" 2>/dev/null
 	}
-	config_list_foreach repacer port etf_one
+	config_list_foreach main port etf_one
 }
 
 start_service() {
 	local enabled
 	config_load reac-repacer
-	config_get_bool enabled repacer enabled 1
+	config_get_bool enabled main enabled 1
 	[ "$enabled" = "1" ] || return 0
 
-	wait_for_fabric || { logger -t reac-rig "fabric iface $WAIT_IFACE never appeared"; return 1; }
+	wait_for_fabric || { logger -t reac-repacer "fabric iface $WAIT_IFACE never appeared"; return 1; }
 	build_args
 	setup_etf
 
@@ -106,7 +106,7 @@ start_service() {
 }
 
 service_triggers() {
-	procd_add_reload_trigger reac-rig
+	procd_add_reload_trigger reac-repacer
 	# Re-evaluate when the fabric iface comes up (e.g. after a network reload).
 	procd_add_interface_trigger "interface.*.up" reactap reload
 }
