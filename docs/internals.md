@@ -78,6 +78,43 @@ A target-depth change walks the occupancy to the new depth with a bounded bias, 
 audio stays continuous and only the latency moves. `--reclaim` (off by default) would
 actively shrink latency and *can* click; the default is grow-only.
 
+## How a real stagebox locks — and where the re-pacer differs
+
+Comparing the re-pacer to a hardware REAC stagebox sharpens what it does well and
+where it can still improve. A real stagebox is a **synchronous TDM clock slave**: it
+doesn't just match the master's *rate*, it **phase-locks to the master's slot grid**.
+Each downstream frame defines a slot boundary, and the box answers its upstream a
+**fixed offset after that boundary** — its whole timebase is hung off the arrival
+edge of the master broadcast, so it sits at a constant phase within every slot, not
+just at the right average frequency. (Observed on the wire: the box's return cadence
+tracks the master's downstream cadence frame-for-frame, with no buffer of its own.)
+
+The re-pacer, by contrast, **rate-locks**: it recovers the master's *rate* from the
+arrival cadence (see above) and runs a clean free-running pacer at that rate, while a
+buffer absorbs the burstiness the wire adds. It only **optionally** phase-aligns —
+`pace_by_downstream` (the AP/master-side profile) nudges the emit instant toward the
+downstream occupancy, but the steady default is a free-running emit clock whose phase
+relative to the desk's slot grid is left wherever it started.
+
+So the rate side of the problem is well covered (the PLL nulls long-term drift to
+sub-ppm). The **biggest remaining improvement is phase**: drive the emit instant to a
+fixed offset from the desk's own slot boundaries — i.e. track *when* in each slot the
+master would have placed the frame — rather than only nulling long-term rate drift on
+a free-running phase. That is what would make the relayed cadence indistinguishable
+from a real box to the slave's recovery loop, not merely the same average rate.
+**[inferred]** — the phase-lock win is reasoned from the hardware's behaviour, not yet
+measured as an audible improvement on the rig.
+
+What the comparison also **validates** is the architecture itself. A hardware stagebox
+of the slave/splitter class does exactly the shape the re-pacer does: it is a
+**clock-slave on its input, re-driven as clock-master on its output**, with an
+**elastic buffer** between the two halves and a **per-frame counter re-stamp** on the
+frames it re-emits. The re-pacer is the same pipeline — recover the input cadence,
+buffer, re-impose a clean cadence, rewrite the per-frame counter on egress — so the
+re-pacer's design is the software expression of a pattern Roland's own hardware uses,
+which is reassuring evidence the approach is sound. The difference is only in how
+tightly each side closes the phase loop, not in the overall shape.
+
 ## The buffer
 
 - **`prefill_ms`** — the target buffer depth, filled before emitting begins, and the
