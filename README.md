@@ -9,8 +9,9 @@ Communications*.
 
 ## What it does
 
-A REAC stagebox is a clock slave: it expects a frame roughly every 125 µs and
-clicks if the cadence stalls. Wi-Fi delivers in bursts. `reac-repacer` sits at
+A REAC stagebox is a clock slave: it expects a frame at a fixed cadence (a frame
+every 125 µs at 96 kHz, 250 µs at 48 kHz, 272 µs at 44.1 kHz) and clicks if that
+cadence stalls. Wi-Fi delivers in bursts. `reac-repacer` sits at
 the receiving end, buffers the master broadcast a few milliseconds, and re-emits
 a constant cadence on a recovered clock to the local stagebox — so the stagebox
 stays locked. One daemon paces every REAC port on a single shared clock, so the
@@ -22,6 +23,17 @@ It does **not** decode REAC, reorder bytes, or tag VLANs — it relays whole L2
 frames. The VLAN trunk + gretap fabric is the separate
 [reac-transport](https://github.com/FreeREAC/reac-transport) package; install
 both when the path crosses Wi-Fi.
+
+## Sample rates
+
+REAC carries no rate field on the wire — the sample rate *is* the packet rate
+(`pps = rate / 12`: 3675 pps at 44.1 kHz, 4000 at 48 kHz, 8000 at 96 kHz).
+`reac-repacer` **auto-detects** the rate by measuring the packet cadence on the wired
+side and paces its output at exactly that period (`1e9 / pps` ns). It tracks the live
+rate, so switching the console 44.1 ↔ 48 ↔ 96 kHz re-locks the relay on the fly; the
+frame is rate-invariant, so nothing else about the relay changes. The detection window
+is the `detect_ms` UCI option. For the underlying REAC clock model, see
+[reac-protocol](https://github.com/FreeREAC/reac-protocol/blob/main/wire-format.md).
 
 ## Build
 
