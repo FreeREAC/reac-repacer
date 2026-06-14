@@ -57,7 +57,9 @@ The apks land in `.build/out/`; the SDK is downloaded once and cached.
 
 Edit `/etc/config/reac-repacer` (section `main`) or use the LuCI page
 (*Services → REAC Wi-Fi Re-pacer*). The directional AP/STA profile is auto-filled
-at install from the box's Wi-Fi role. Full option reference: `man reac-repacer`.
+at install from the box's Wi-Fi role. Full option reference: `man reac-repacer`; how
+the buffer, recovered clock, PLL/servo and interface binding work and how to tune
+them: **[docs/internals.md](docs/internals.md)**.
 
 Retune the running daemon without a restart:
 
