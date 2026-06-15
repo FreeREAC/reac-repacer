@@ -1,0 +1,22 @@
+[Unit]
+Description=REAC Wi-Fi de-jitter re-pacer (reac-repacer)
+Documentation=man:reac-repacer(8) https://github.com/FreeREAC/reac-repacer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit /etc/reac-repacer/reac-repacer.conf to set the --port pairs + options.
+EnvironmentFile=/etc/reac-repacer/reac-repacer.conf
+ExecStart=/usr/bin/reac-repacer $REPACER_ARGS
+# raw capture + tc/SO_TXTIME pacing without running as root
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+Restart=on-failure
+RestartSec=2
+# realtime pacing (PREEMPT_RT)
+LimitRTPRIO=95
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
