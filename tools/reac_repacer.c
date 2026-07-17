@@ -117,8 +117,9 @@
 
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t got_hup = 0;   /* SIGHUP -> re-read UCI + apply hot params (set in the
-                                             * handler only; the main loop does the work, so the
-                                             * handler stays async-signal-safe) */
+                                             * handler only; the non-RT housekeeper thread does the
+                                             * popen work, so the handler stays async-signal-safe and
+                                             * no fork ever runs on the SCHED_FIFO pacing thread) */
 
 /* Live-reconfig request. A trigger (ubus set / SIGHUP) writes the new HOT params here
  * and bumps reconf_gen; the pacing loop notices the bump, clamps + applies them through
@@ -275,7 +276,7 @@ static struct stream streams[MAX_STREAMS];
 static int n_streams;
 
 static void on_sig(int s) { (void)s; running = 0; }
-static void on_hup(int s) { (void)s; got_hup = 1; }   /* defer the work to the main loop */
+static void on_hup(int s) { (void)s; got_hup = 1; }   /* defer the UCI re-read to the non-RT housekeeper */
 
 static long long ns_now(void) {
 	struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -849,8 +850,9 @@ static void apply_hot_params(struct pacer_live *L, const struct hot_params *in) 
 
 /* SIGHUP path: re-read the HOT params from /etc/config/reac-repacer via the uci CLI
  * (always present under procd; avoids linking libuci) and stage them. Anything absent
- * keeps the running value (passed in via cur). Done from the main loop, never the
- * handler. */
+ * keeps the running value (passed in via cur). Done from the non-RT housekeeper thread,
+ * never the RT pacing loop or the signal handler -- popen() is a fork+exec of an
+ * mlockall'd process and must never run on the SCHED_FIFO emit thread. */
 static int uci_get_int(const char *opt, int cur) {
 	char cmd[160]; snprintf(cmd, sizeof cmd, "uci -q get reac-repacer.main.%s", opt);
 	FILE *f = popen(cmd, "r");
@@ -860,15 +862,62 @@ static int uci_get_int(const char *opt, int cur) {
 	pclose(f);
 	return v;
 }
-static void reload_hot_params_from_uci(struct pacer_live *L) {
-	struct hot_params p = {
-		.prefill_ms      = uci_get_int("prefill_ms",      L->prefill_ms),
-		.adapt_min_ms    = uci_get_int("adapt_min_ms",    g_adapt_min_ms),
-		.adapt_max_ms    = uci_get_int("adapt_max_ms",    g_adapt_max_ms),
-		.adapt_margin    = uci_get_int("adapt_margin",    g_adapt_margin),
-		.servo_clamp_ppm = uci_get_int("servo_clamp_ppm", g_servo_clamp_ppm),
-	};
-	apply_hot_params(L, &p);
+/* ---- non-RT housekeeper: flash persistence + UCI reload, kept OFF the SCHED_FIFO emit
+ * thread ----------------------------------------------------------------------------
+ * The RT pacing thread must never touch flash (fopen/fprintf/rename) nor fork (popen):
+ *   - a flash-overlay GC stall on OpenWrt would leave the next absolute deadline in the
+ *     past, forcing a catch-up burst = exactly the glitch this pacer exists to remove;
+ *   - popen("uci get") is a fork+exec of an mlockall'd SCHED_FIFO process (and a banned
+ *     subprocess on the audio thread).
+ * So both slow paths run on this ordinary-priority thread. The channel is lock-free: the
+ * RT thread only stores a value and raises a flag (plain memory writes -- no lock, no
+ * syscall, no malloc), and this thread polls the flags and does the blocking work. The
+ * staged UCI params are handed back through the existing glitch-free apply_hot_params
+ * retarget, applied on the RT loop's next tick. */
+static volatile sig_atomic_t g_persist_req = 0;    /* RT -> housekeeper: persist the staged period */
+static long g_persist_period = 0;                  /* period (ns) to persist; word-atomic long */
+static struct hot_params g_uci_pending;            /* housekeeper -> RT: staged UCI hot params */
+static volatile sig_atomic_t uci_reconf_gen = 0;   /* bumped once g_uci_pending is fully written */
+static struct pacer_live *g_house_live;            /* published so the housekeeper can seed absent keys */
+
+/* publish the loop's live view for the housekeeper. Assigned through a function boundary so
+ * the analyzer does not read it as a dangling local: `live` outlives the housekeeper, which is
+ * joined before main() returns. */
+static __attribute__((noinline)) void house_publish(struct pacer_live *L) { g_house_live = L; }
+
+static void *housekeeper(void *arg) {
+	(void)arg;
+	while (running) {
+		/* SIGHUP -> re-read the UCI hot params HERE (popen/fork/malloc off the RT thread) and
+		 * stage them; the RT loop applies them through apply_hot_params on its next tick. Wait
+		 * until the loop has published its live view (g_house_live) before seeding absent keys.
+		 * Clear the flag FIRST so a SIGHUP arriving during the reads is caught on the next poll. */
+		if (got_hup && g_house_live) {
+			got_hup = 0;
+			struct pacer_live *L = g_house_live;
+			struct hot_params p = {
+				.prefill_ms      = uci_get_int("prefill_ms",      L->prefill_ms),
+				.adapt_min_ms    = uci_get_int("adapt_min_ms",    g_adapt_min_ms),
+				.adapt_max_ms    = uci_get_int("adapt_max_ms",    g_adapt_max_ms),
+				.adapt_margin    = uci_get_int("adapt_margin",    g_adapt_margin),
+				.servo_clamp_ppm = uci_get_int("servo_clamp_ppm", g_servo_clamp_ppm),
+			};
+			hot_params_clamp(&p);          /* validate ranges before staging */
+			g_uci_pending = p;
+			__atomic_thread_fence(__ATOMIC_RELEASE);   /* publish the struct before the gen bump */
+			uci_reconf_gen++;              /* the loop reads g_uci_pending only after seeing this */
+		}
+		/* persist the converged emit period the RT thread staged (rewrite the warm-start
+		 * lockfile via temp + rename). Only fires when the RT thread flagged a change. */
+		if (g_persist_req) {
+			g_persist_req = 0;
+			long per = __atomic_load_n(&g_persist_period, __ATOMIC_ACQUIRE);
+			lock_save(per);
+		}
+		struct timespec ts = { 0, 200000000 };   /* 200 ms poll: negligible vs the ~30 s persist cadence */
+		nanosleep(&ts, NULL);
+	}
+	return NULL;
 }
 
 #ifdef HAVE_UBUS
@@ -1198,6 +1247,12 @@ int main(int argc, char **argv) {
 		g_ds_cpu = cpu;
 		pthread_t dt; pthread_create(&dt, NULL, ds_pacer, &streams[0]);
 	}
+	/* non-RT housekeeper: does the flash writes (warm-start lockfile) and the popen("uci get")
+	 * SIGHUP reloads OFF the SCHED_FIFO pacing thread. Created BEFORE the RT promotion below so it
+	 * inherits SCHED_OTHER and the default (unpinned) affinity -- it must never run at RT prio nor
+	 * on the pacer's isolated core. Joined at shutdown so its lock_save never races the exit one. */
+	pthread_t house_th; int house_ok = (pthread_create(&house_th, NULL, housekeeper, NULL) == 0);
+	if (!house_ok) fprintf(stderr, "housekeeper: pthread_create failed; warm-start persist + SIGHUP reload disabled\n");
 
 	/* one RT pacing thread (this one) on a dedicated core, isolated from the NIC IRQ core */
 	cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set); sched_setaffinity(0, sizeof set, &set);
@@ -1419,8 +1474,10 @@ int main(int argc, char **argv) {
 		.prefill = &prefill, .shtgt = &shtgt, .t_floor = &t_floor, .t_ceil = &t_ceil,
 		.max_ppm = &max_ppm, .retarget_ppm = &retarget_ppm, .retarget_ticks = &retarget_ticks,
 	};
+	house_publish(&live);               /* publish the live view for the non-RT housekeeper */
 	int ubus_fd = ubus_setup(&live);
 	int applied_gen = reconf_gen;
+	int applied_uci_gen = uci_reconf_gen;
 
 	while (running) {
 		long long wake = g_etf ? deadline - g_etf_lead_ns : deadline;   /* ETF: wake loose, kernel times the egress */
@@ -1438,12 +1495,18 @@ int main(int argc, char **argv) {
 			pace_one(&streams[i], &active, eq_floor, eq_done, join_depth);
 		}
 
-		/* service the two live-reconfig triggers AFTER the emit (the emit is the jitter-critical
-		 * part; the apply takes effect from the next tick). ubus set stages into g_pending + bumps
-		 * reconf_gen; SIGHUP re-reads UCI here (async-safe -- the handler only set a flag). Both
-		 * funnel through apply_hot_params -> the shared glitch-free retarget. */
+		/* service the live-reconfig triggers AFTER the emit (the emit is the jitter-critical
+		 * part; the apply takes effect from the next tick). Both funnel through apply_hot_params
+		 * -> the shared glitch-free retarget, and NEITHER does I/O on this thread:
+		 *   - ubus set stages into g_pending + bumps reconf_gen (drained here off the ubus socket);
+		 *   - SIGHUP is serviced by the non-RT housekeeper, which does the popen("uci get") reads
+		 *     off this thread and stages the result into g_uci_pending + bumps uci_reconf_gen. */
 		ubus_service(ubus_fd);
-		if (got_hup) { got_hup = 0; reload_hot_params_from_uci(&live); applied_gen = reconf_gen; }
+		if (uci_reconf_gen != applied_uci_gen) {
+			__atomic_thread_fence(__ATOMIC_ACQUIRE);   /* pair with the housekeeper's release fence */
+			applied_uci_gen = uci_reconf_gen;
+			apply_hot_params(&live, &g_uci_pending);
+		}
 		if (reconf_gen != applied_gen) { applied_gen = reconf_gen; apply_hot_params(&live, &g_pending); }
 		/* latch the occupancy-anchored start once every initially-active port has begun. ONE-TIME;
 		 * only re-armed on a rate-change relock. This also un-freezes the PLL below. */
@@ -1582,7 +1645,11 @@ int main(int argc, char **argv) {
 		 * ever persist a CONVERGED period (never a pre-lock transient), plus eq_done + no in-flight depth
 		 * walk; the file write is off the jitter-critical emit. */
 		if (g_warm_start && (pll_locked || clk_act) && eq_done && retarget_ticks == 0 && have && ++lock_div >= LOCK_SAVE_WIN) {
-			if (period_ns != lock_saved_per) { lock_save(period_ns); lock_saved_per = period_ns; }   /* flash write on the RT thread: only when changed */
+			if (period_ns != lock_saved_per) {   /* only when changed: hand the flash write to the housekeeper */
+				__atomic_store_n(&g_persist_period, period_ns, __ATOMIC_RELEASE);
+				g_persist_req = 1;               /* lock-free store + flag; no fopen/rename on this thread */
+				lock_saved_per = period_ns;
+			}
 			lock_div = 0;
 		}
 		/* glitch-free occupancy retarget: while a depth change is walking in, bias THIS tick's
@@ -1768,6 +1835,10 @@ int main(int argc, char **argv) {
 			last = now;
 		}
 	}
+	/* stop the housekeeper (running is already 0 here) and join it before the exit-time lock_save,
+	 * so the two never write the lockfile concurrently. The loop below runs on the main thread,
+	 * still SCHED_FIFO, but pacing has ended -- there is no deadline left to miss. */
+	if (house_ok) pthread_join(house_th, NULL);
 	/* persist the converged lock on a clean exit so a stop/start (or deploy) restarts already-locked.
 	 * Gated on pll_locked: never persist a pre-convergence period (it would warm-restore a bad rate). */
 	if (g_warm_start && (pll_locked || clk_act) && eq_done) lock_save(period_ns);
