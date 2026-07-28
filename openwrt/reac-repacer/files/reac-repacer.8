@@ -1,6 +1,6 @@
 .\" SPDX-License-Identifier: GPL-3.0-or-later
 .\" Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
-.TH REAC-REPACER 8 "2026-06-13" "reac-repacer 0.2.3" "System Manager's Manual"
+.TH REAC-REPACER 8 "2026-07-29" "reac-repacer 0.2.3" "System Manager's Manual"
 .SH NAME
 reac-repacer \- de-jitter / re-pacing relay for a Roland REAC stream over Wi-Fi
 .SH SYNOPSIS
@@ -52,7 +52,22 @@ owns the clock and tolerates input jitter.
 .PP
 One daemon handles one or more REAC ports of a single mixer on one shared pacing
 clock, so the stageboxes stay sample-phase-aligned with each other. The relay does
-not decode REAC, reorder or alter bytes, or do VLAN tagging.
+not decode the audio payload, reorder frames, or do VLAN tagging.
+.PP
+It is not byte-transparent. Every emitted frame has its 16-bit frame counter (bytes
+14 and 15) re-stamped from the daemon's own monotonic sequence, so the output is
+contiguous even where the input had holes; bytes 16 and 17 are read to tell a control
+frame from an audio frame, so that control frames ride the cadence in sequence rather
+than jumping ahead of it. A counter discontinuity observed downstream of the re-pacer
+therefore did not come from the wire.
+.PP
+Gap concealment (on by default, see
+.BR \-\-no\-plc )
+goes further and emits a frame that never arrived: on ring underrun the last frame is
+repeated under the next counter. A verbatim repeat is not used, because reusing a
+counter reads as 65535 lost frames at the slave. Under a sustained underrun the
+stagebox is therefore fed audio the master never sent, which is the intended trade but
+means an unclicking box is not by itself proof that the link delivered every frame.
 .PP
 At least one
 .B \-\-port
@@ -64,6 +79,13 @@ pacer on default interfaces.
 .BI \-\-port " IN:OUT"
 Define a REAC port as an IN:OUT interface pair (IN = tunnel side, OUT = stagebox
 side). Repeat the option once per port. Required.
+.IP
+In UCI the same entry takes an optional third field,
+.IR IN:OUT:etf_delta_us ,
+which is the per-port ETF window. The init script consumes that field when it
+installs the qdisc and passes only
+.I IN:OUT
+to the daemon, so the daemon itself never sees it.
 .TP
 .BI \-\-prefill\-ms " N"
 Target buffer depth, in milliseconds, filled before emitting begins. Default 12.
@@ -76,9 +98,10 @@ Default 700.
 Enable the glacial frequency-lock that converges the base period to null the
 long-term occupancy drift. Default off.
 .TP
-.B \-\-forward\-only
+.BR \-\-forward\-only ", " \-\-no\-return
 De-jitter only the forward (IN to OUT) direction and do not run the return
-pass-through thread. Used on the mixer side. Default off.
+pass-through thread. Used on the mixer side. The two spellings are the same flag.
+Default off.
 .TP
 .B \-\-bcast\-only
 Accept only the master broadcast frames. Default off.
@@ -113,9 +136,96 @@ Do not persist or restore the converged lock. Warm-start is on by default.
 .BI \-\-lockfile " PATH"
 Path of the warm-start state file. Default /etc/reac-repacer.lock.
 .TP
+.BI \-\-clock\-source " wifi|local|local\-in"
+Where the emit clock's base reference comes from.
+.B wifi
+uses the occupancy PLL alone;
+.B local
+counts frames on the wired OUT port (the master crystal, exact, so Wi-Fi carries
+data and never timing);
+.B local\-in
+counts them on the wired IN port, i.e. the mixer's rate. Default
+.BR wifi ,
+but the init always passes this flag, so on a router the directional profile decides
+(AP side
+.BR local ,
+STA side
+.BR local\-in ).
+.TP
+.B \-\-pace\-by\-downstream
+Emit each frame as a response to a downstream frame arriving on the wired OUT port,
+the way a real stagebox does, so the desk supplies phase as well as rate. AP /
+master-side profile. Default off.
+.TP
+.BI \-\-clock\-margin\-ppm " N"
+In the wired clock-source modes, the cumulative-rate change in ppm that re-applies the
+emit period from the counted rate; it is also the PLL lock margin. Default 2; the
+shipped UCI profile passes 8.
+.TP
+.BI \-\-detect\-ms " N"
+Rate-detection / presence window in milliseconds. Default 60; the shipped UCI profile
+passes 2000.
+.TP
+.BI \-\-detect\-confirm " N"
+Consecutive detection windows that must agree before a sample-rate family change is
+accepted. Default 2.
+.TP
+.BI \-\-mute\-ms " N"
+Silence the audio for this many milliseconds across a rate-change transition, so the
+re-lock is not audible. Default 250.
+.TP
+.B \-\-etf
+Time egress with the kernel's SO_TXTIME / sch_etf rather than leaving frames at
+sendmsg time with SCHED_FIFO wake jitter. Needs the etf qdisc on the OUT port, which
+the init installs on the AP side. Default off.
+.TP
+.BI \-\-etf\-lead\-ms " N"
+How far ahead of the target egress instant the pacer submits the frame to the kernel.
+Default 4.
+.TP
+.B \-\-no\-plc
+Disable gap concealment. With it disabled a ring underrun leaves the slot empty
+instead of repeating the last frame under the next counter. Concealment is on by
+default; see DESCRIPTION for what it costs.
+.TP
+.BI \-\-pll\-fgain " F"
+Fraction of the measured rate error the PLL nulls per correction. Default 0.6.
+.TP
+.B \-\-pll\-pos\-min
+Drive the PLL's position term from the tightest port's occupancy rather than the mean
+depth across ports. Default off (mean depth).
+.TP
+.BI \-\-prio " N"
+SCHED_FIFO priority of the pacing thread. Default 80.
+.TP
+.BI \-\-period\-ns " N"
+Pin the emit period explicitly, in nanoseconds, and disable rate auto-detection.
+Default 250000 (48 kHz), used only when auto-detection is off.
+.TP
+.B \-\-no\-auto\-rate
+Disable rate auto-detection and hold the period at
+.BR \-\-period\-ns .
+.TP
 .BR \-h ", " \-\-help
 Print the usage message to standard output and exit 0 without starting the
 daemon.
+.SS Diagnostic flags
+These exist for A/B testing on a rig and must never ship enabled. They are not
+reachable from UCI.
+.TP
+.B \-\-bypass
+Relay frames straight through with no ring and no pacing.
+.TP
+.B \-\-ctrl\-bypass
+Send control frames immediately instead of in cadence. This deliberately violates the
+one-frame-per-slot rule and reproduces the heartbeat click artifact; it exists to
+demonstrate the fault, not to be used.
+.TP
+.BI \-\-inject\-sine " SLOT[:FREQ]"
+Overwrite a channel slot with a test tone.
+.TP
+.BI \-\-inject\-copy " SRC:DST"
+Copy one channel slot over another.
 .SH STEADY CLOCK AND WARM-START
 With the steady free-running output clock (on by default), the emit period
 free-runs at the detected base period and is not modulated per tick or per
@@ -208,11 +318,21 @@ lan1 124867 96000 1749150000
 .I /etc/config/reac-repacer
 UCI configuration read at startup and on
 .BR SIGHUP .
-The
-.B main
-section holds the global and hot parameters; each
-.B port
-section is one REAC zone.
+There is a single
+.B config repacer 'main'
+section; it holds the global and hot parameters, and one
+.B list port
+entry per REAC zone. There are no separate per-port sections.
+.IP
+Not every UCI name reaches the daemon at launch:
+.IR adapt_min_ms ,
+.IR adapt_max_ms
+and
+.I adapt_margin
+are read only on the SIGHUP / ubus path, so at startup the compiled defaults apply,
+and there is no UCI name for
+.BR \-\-adapt
+at all.
 .SH EXAMPLES
 Three ports of one mixer with a 16 ms target depth:
 .PP
