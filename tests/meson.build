@@ -9,3 +9,9 @@ test_inject = executable('test-inject',
   dependencies : repacer_deps,
   install : false)
 test('inject-goldens', test_inject)
+
+test_geometry = executable('test-geometry',
+  'test_geometry.c',
+  dependencies : repacer_deps,
+  install : false)
+test('frame-geometry', test_geometry)

@@ -85,6 +85,15 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/net_tstamp.h>
+
+/* libreac -- the shared REAC wire-format core. Used ONLY by the test-only inject
+ * paths below (--inject-sine / --inject-copy), which are the only code here that
+ * looks inside a frame; the relay stays byte-blind and needs none of it.
+ *   <reac/reac.h>        EtherType + frame geometry + the OHRCA +2 trailer rule
+ *   <reac/reac_braid.h>  the channel-pair byte map (the single layout oracle) */
+#include <reac/reac.h>
+#include <reac/reac_braid.h>
+
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
 #endif
@@ -313,6 +322,43 @@ static int g_pace_ds;   /* --pace-by-downstream: emit each upstream frame as a t
 static int32_t g_cpr[CPR_SZ];
 static volatile unsigned g_cpr_w, g_cpr_r;
 
+/* Channel width of a REAC audio frame, from its length on the wire -- the one
+ * home for the frame geometry the inject paths need. A REAC frame, in either
+ * direction, is REAC_UPSTREAM_OVERHEAD (52: the 50 B header plus the C2 EA end
+ * marker) + nch * REAC_UPSTREAM_BYTES_PER_CH (36 = 12 samples x 3 B), and an
+ * OHRCA fabric (M-5000/M-480, and the S-4000) appends a 2-byte CRC trailer after
+ * the end marker -- reac_frame_clean_len() strips it. nch is even: the braid
+ * packs channel PAIRS.
+ *
+ * Not libreac's reac_upstream_channels(), despite that being the same arithmetic:
+ * it rejects the 40-channel solution, because for a BOX RETURN 1492 B is the
+ * master's downstream broadcast and never a legal upstream. Both frames reach
+ * this code -- inj_copy_rx reads the desk's 40-channel downstream off the wired
+ * OUT port, and whether the emitted frames are box-width or the 40-ch broadcast
+ * depends on which side of the link the daemon sits on -- so the range accepted
+ * here is 2..40 inclusive.
+ *
+ * Returns -1 for anything that is not a legal REAC audio frame. The expression
+ * this replaced, (len - 50) / 36, never returned -1: an odd or off-grid width
+ * came back as a plausible-looking count, and a wrong nch is a wrong braid
+ * stride, which walks the last time-sample's writes past the audio region and
+ * into the end marker. (It did NOT, however, mis-count a trailered OHRCA frame:
+ * the truncating divide absorbs +2 at every legal width -- pinned in
+ * tests/test_geometry.c so the point is not re-litigated.) */
+static int frame_channels(int len)
+{
+	if (len < 0)
+		return -1;
+	size_t clean = reac_frame_clean_len((size_t)len);
+	if (clean < REAC_UPSTREAM_OVERHEAD ||
+	    (clean - REAC_UPSTREAM_OVERHEAD) % REAC_UPSTREAM_BYTES_PER_CH != 0)
+		return -1;
+	int nch = (int)((clean - REAC_UPSTREAM_OVERHEAD) / REAC_UPSTREAM_BYTES_PER_CH);
+	if (nch < 2 || nch > REAC_MAX_CHANNELS || (nch & 1))
+		return -1;
+	return nch;
+}
+
 static void *inj_copy_rx(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
 	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;
@@ -322,9 +368,9 @@ static void *inj_copy_rx(void *arg) {
 		if (n < 50) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;
 		uint8_t *r = buf; int len = (int)n;
-		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && r[16] == 0x88 && r[17] == 0x19) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
-		if (!(r[12] == 0x88 && r[13] == 0x19) || !(r[16] == 0 && r[17] == 0)) continue;
-		int nch = (len - 50) / 36; if (nch < 1 || g_cp_src >= nch) continue;
+		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && ((r[16] << 8) | r[17]) == REAC_ETHERTYPE) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
+		if (!reac_frame_is_reac(r, (size_t)len) || !(r[16] == 0 && r[17] == 0)) continue;
+		int nch = frame_channels(len); if (nch < 0 || g_cp_src >= nch) continue;
 		uint8_t *a = r + 50; int base = (g_cp_src & ~1) * 3;
 		for (int s2 = 0; s2 < 12; s2++) {
 			uint8_t *sp = a + base + s2 * (nch * 3);
@@ -342,7 +388,7 @@ static void *inj_copy_rx(void *arg) {
 
 static void inj_copy(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;
-	int nch = (len - 50) / 36; if (nch < 1 || g_cp_dst >= nch) return;
+	int nch = frame_channels(len); if (nch < 0 || g_cp_dst >= nch) return;
 	uint8_t *a = f + 50; int base = (g_cp_dst & ~1) * 3;
 	static int32_t last;
 	static int primed;
@@ -365,7 +411,7 @@ static void inj_copy(uint8_t *f, int len) {
 
 static void inj_sine(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;          /* audio frames only */
-	int nch = (len - 50) / 36; if (nch < 1) return;
+	int nch = frame_channels(len); if (nch < 0) return;
 	if (g_inj_slot >= nch) return;
 	uint8_t *a = f + 50;
 	int base = (g_inj_slot & ~1) * 3;
