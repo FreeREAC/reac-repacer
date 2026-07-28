@@ -49,3 +49,5 @@ executable('pacer-probe',
   'tools/pacer_probe.c',
   dependencies : [threads_dep, m_dep],
   install : false)
+
+subdir('tests')
