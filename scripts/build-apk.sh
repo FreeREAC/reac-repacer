@@ -7,6 +7,7 @@
 # stages + builds only the packages that exist here.
 #   OPENWRT_RELEASE  pin a release (default: latest stable)
 #   OPENWRT_TARGET   target board (default mediatek/filogic)
+#   LIBREAC_REF      libreac branch/tag to build against (default: main)
 set -euo pipefail
 REPO=/repo; WORK=/work; OUT_DIR="$WORK/out"
 TARGET="${OPENWRT_TARGET:-mediatek/filogic}"
@@ -34,11 +35,27 @@ cd "$SDK_DIR"
 [ -d feeds/luci ] || { cp feeds.conf.default feeds.conf; ./scripts/feeds update -a >/tmp/feeds.log 2>&1 || { tail -20 /tmp/feeds.log; exit 1; }; ./scripts/feeds install luci-base >/dev/null 2>&1 || true; }
 
 echo "== stage packages present in this repo =="
-rm -rf package/reac-* package/luci-app-reac-*
+rm -rf package/reac-* package/luci-app-reac-* package/libreac
 # Purge stale reac apks from the shared SDK bin/ (the cache persists across repo
 # builds) so out/ only ever holds packages THIS repo produced this run.
 find bin -name '*.apk' -iname '*reac*' -delete 2>/dev/null || true
 PKGS=""
+# Dependency packages: built so the SDK staging dir carries their headers + libs,
+# but NOT copied to out/ — each repo releases its own apks. Install libreac on the
+# device from the libreac repo's release.
+DEP_PKGS=""
+# reac-repacer DEPENDS on +libreac, which lives in its own repo, so the SDK cannot
+# resolve it from a feed. Clone it (shallow, cached under $WORK) and stage its own
+# OpenWrt recipe next to ours. LIBREAC_REF pins a tag when a release needs pinning.
+LIBREAC_SRC="$WORK/libreac"
+rm -rf "$LIBREAC_SRC"
+git clone -q --depth 1 -b "${LIBREAC_REF:-main}" https://github.com/FreeREAC/libreac.git "$LIBREAC_SRC"
+echo "libreac $(git -C "$LIBREAC_SRC" rev-parse --short HEAD) (${LIBREAC_REF:-main})"
+mkdir -p package/libreac
+cp "$LIBREAC_SRC/openwrt/libreac/Makefile" package/libreac/Makefile
+cp -r "$LIBREAC_SRC/src" "$LIBREAC_SRC/include" package/libreac/
+DEP_PKGS="libreac"
+
 if [ -d "$REPO/openwrt/reac-aes67" ] && ls "$REPO"/src/*.c >/dev/null 2>&1; then
   mkdir -p package/reac-aes67/src package/reac-aes67/files
   cp "$REPO/openwrt/reac-aes67/Makefile" package/reac-aes67/Makefile
@@ -65,15 +82,16 @@ fi
 for la in luci-app-reac-aes67 luci-app-reac-repacer; do
   if [ -d "$REPO/openwrt/$la" ]; then mkdir -p package/$la; cp -r "$REPO"/openwrt/$la/* package/$la/; PKGS="$PKGS $la"; fi
 done
-echo "staging:$PKGS"
+echo "staging:$PKGS (deps:$DEP_PKGS)"
 [ -n "$PKGS" ] || { echo "ERROR: no reac packages found in $REPO"; exit 1; }
 
 echo "== configure =="
 make defconfig >/dev/null 2>&1
-for p in $PKGS; do echo "CONFIG_PACKAGE_$p=y"; done >> .config
+for p in $DEP_PKGS $PKGS; do echo "CONFIG_PACKAGE_$p=y"; done >> .config
 make defconfig >/dev/null 2>&1
 
-for pkg in $PKGS; do
+# deps first: reac-repacer's compile needs libreac's headers + lib in the staging dir
+for pkg in $DEP_PKGS $PKGS; do
   echo "== compile $pkg =="
   make "package/$pkg/compile" V=s -j"$(nproc)" 2>&1 | tee "/tmp/build-$pkg.log" | tail -4 || { echo "--- $pkg tail ---"; tail -40 "/tmp/build-$pkg.log"; exit 1; }
 done

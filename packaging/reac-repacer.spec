@@ -12,14 +12,16 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
+BuildRequires:  libreac-devel >= 0.4.0
 Requires:       iproute
 
 %description
 reac-repacer sits in the REAC signal path and removes Wi-Fi jitter: it buffers
 the stream, re-clocks it from a free-running media clock, conceals gaps, and
-re-locks to live sample-rate changes (44.1/48/96 kHz). It is a single
-self-contained C program; this Fedora build omits the OpenWrt ubus management
-interface (built without -DHAVE_UBUS). Needs iproute (tc/ip) at runtime.
+re-locks to live sample-rate changes (44.1/48/96 kHz). It is a single C program
+over libreac (the shared REAC wire-format core, used by the test-only inject
+paths); this Fedora build omits the OpenWrt ubus management interface (built
+without -DHAVE_UBUS). Needs iproute (tc/ip) at runtime.
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -27,7 +29,7 @@ interface (built without -DHAVE_UBUS). Needs iproute (tc/ip) at runtime.
 %build
 # Production ring size (the source ships the larger test ring).
 sed -i 's/^#define RING_BITS 14 .*/#define RING_BITS 11   \/* prod ring *\//' tools/reac_repacer.c
-cc %{optflags} -std=c11 -pthread -o reac-repacer tools/reac_repacer.c -lm
+cc %{optflags} -std=c11 -pthread -o reac-repacer tools/reac_repacer.c -lreac -lm
 
 %install
 install -Dm0755 reac-repacer %{buildroot}%{_bindir}/reac-repacer
