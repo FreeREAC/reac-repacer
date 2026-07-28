@@ -112,6 +112,41 @@ static uint64_t copy_case(int nch, int trailer)
 	return h;
 }
 
+/* The read half of the braid — braid_read(), which inj_copy_rx drives on the
+ * OUT-port frames — cannot be reached through the digests above: it lives behind
+ * a blocking AF_PACKET loop, and the goldens only pin what goes ONTO the wire.
+ * It is pinned instead by inversion. The write map is already golden-pinned byte
+ * for byte across the whole domain, so showing that braid_read recovers exactly
+ * what braid_write placed, at every width and slot and over values that exercise
+ * both polarities and the bit-23 sign extension, pins the read map to the same
+ * bytes. A read map that disagreed with the golden write map could not round-trip.
+ */
+static void roundtrip_case(int nch, int *fails_out)
+{
+	/* zero, both polarities at ±1, full scale either side of the sign boundary,
+	 * quarter scale, and values that isolate each of the three bytes */
+	static const int32_t vec[REAC_SAMPLES_PER_PKT] = {
+		0, 1, -1, 0x7fffff, -0x800000, 0x400000, -0x400000,
+		0x123456, -0x123456, 0x00ff00, 0x0000ff, 0x00ffff
+	};
+	uint8_t f[2048];
+
+	for (int slot = 0; slot < nch; slot++) {
+		(void)build_frame(f, nch, 0);
+		uint8_t *a = f + REAC_AUDIO_OFFSET;
+		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++)
+			braid_write(a, s2, slot, nch, vec[s2]);
+		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
+			int32_t got = braid_read(a, s2, slot, nch);
+			if (got != vec[s2]) {
+				(*fails_out)++;
+				fprintf(stderr, "FAIL braid round-trip %d ch slot %d sample %d: "
+				        "%" PRId32 " != %" PRId32 "\n", nch, slot, s2, got, vec[s2]);
+			}
+		}
+	}
+}
+
 static void ring_init(void)
 {
 	for (unsigned i = 0; i < CPR_SZ; i++) {
@@ -173,7 +208,11 @@ int main(int argc, char **argv)
 		}
 	}
 
-	printf("test_inject: %d width/trailer cases (%d slot injections per injector), %d failures\n",
-	       n, 420, fails);
+	for (int nch = 2; nch <= 40; nch += 2)
+		roundtrip_case(nch, &fails);
+
+	printf("test_inject: %d width/trailer cases (%d slot injections per injector), "
+	       "%d braid round-trips, %d failures\n",
+	       n, 420, 420 * REAC_SAMPLES_PER_PKT, fails);
 	return fails ? 1 : 0;
 }

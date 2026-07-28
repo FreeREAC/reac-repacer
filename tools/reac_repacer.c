@@ -359,6 +359,33 @@ static int frame_channels(int len)
 	return nch;
 }
 
+/* One s24 sample of one channel slot, in or out of a frame's braided audio
+ * region. The byte map itself is reac_braid_pos() (<reac/reac_braid.h>),
+ * libreac's single layout oracle -- that header is explicit that no second copy
+ * of the map may exist, and this file used to carry three.
+ *
+ * Not reac_braid_encode(), libreac's whole-region encoder: it writes ALL nch
+ * channels of the region, and an injector overwrites exactly ONE slot and has to
+ * leave every other channel exactly as the desk or the box sent it. The
+ * per-position oracle is the right granularity for a slot patch; the
+ * whole-region one is for a builder that owns the frame it is filling. */
+static inline int32_t braid_read(const uint8_t *a, int s2, int ch, int nch)
+{
+	size_t pos[3];
+	reac_braid_pos(s2, ch, nch, pos);                       /* lo, mid, hi */
+	int32_t v = a[pos[0]] | (a[pos[1]] << 8) | (a[pos[2]] << 16);
+	return (v & 0x800000) ? v - (1 << 24) : v;              /* sign-extend bit 23 */
+}
+
+static inline void braid_write(uint8_t *a, int s2, int ch, int nch, int32_t v)
+{
+	size_t pos[3];
+	reac_braid_pos(s2, ch, nch, pos);
+	a[pos[0]] = (uint8_t)(v & 0xff);                        /* lo  */
+	a[pos[1]] = (uint8_t)((v >> 8) & 0xff);                 /* mid */
+	a[pos[2]] = (uint8_t)((v >> 16) & 0xff);                /* hi  */
+}
+
 static void *inj_copy_rx(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
 	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;
@@ -371,13 +398,9 @@ static void *inj_copy_rx(void *arg) {
 		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && ((r[16] << 8) | r[17]) == REAC_ETHERTYPE) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
 		if (!reac_frame_is_reac(r, (size_t)len) || !(r[16] == 0 && r[17] == 0)) continue;
 		int nch = frame_channels(len); if (nch < 0 || g_cp_src >= nch) continue;
-		uint8_t *a = r + 50; int base = (g_cp_src & ~1) * 3;
-		for (int s2 = 0; s2 < 12; s2++) {
-			uint8_t *sp = a + base + s2 * (nch * 3);
-			uint8_t b0, b1, b2;
-			if (g_cp_src & 1) { b0 = sp[4]; b1 = sp[5]; b2 = sp[2]; }
-			else              { b0 = sp[3]; b1 = sp[0]; b2 = sp[1]; }
-			int32_t v = b0 | (b1 << 8) | (b2 << 16); if (v & 0x800000) v -= (1 << 24);
+		uint8_t *a = r + REAC_AUDIO_OFFSET;
+		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
+			int32_t v = braid_read(a, s2, g_cp_src, nch);
 			unsigned w = g_cpr_w;
 			g_cpr[w & (CPR_SZ - 1)] = v;
 			__atomic_store_n(&g_cpr_w, w + 1, __ATOMIC_RELEASE);
@@ -389,7 +412,7 @@ static void *inj_copy_rx(void *arg) {
 static void inj_copy(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;
 	int nch = frame_channels(len); if (nch < 0 || g_cp_dst >= nch) return;
-	uint8_t *a = f + 50; int base = (g_cp_dst & ~1) * 3;
+	uint8_t *a = f + REAC_AUDIO_OFFSET;
 	static int32_t last;
 	static int primed;
 	unsigned w0 = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
@@ -398,14 +421,11 @@ static void inj_copy(uint8_t *f, int len) {
 		if (w0 - g_cpr_r < 2048) return;
 		g_cpr_r = w0 - 2048; primed = 1;
 	}
-	for (int s2 = 0; s2 < 12; s2++) {
+	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
 		unsigned w = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
 		int32_t v = last;
 		if (w != g_cpr_r) { v = g_cpr[g_cpr_r & (CPR_SZ - 1)]; g_cpr_r++; last = v; }
-		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
-		uint8_t *sp = a + base + s2 * (nch * 3);
-		if (g_cp_dst & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
-		else              { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+		braid_write(a, s2, g_cp_dst, nch, v);
 	}
 }
 
@@ -413,16 +433,12 @@ static void inj_sine(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;          /* audio frames only */
 	int nch = frame_channels(len); if (nch < 0) return;
 	if (g_inj_slot >= nch) return;
-	uint8_t *a = f + 50;
-	int base = (g_inj_slot & ~1) * 3;
-	for (int s2 = 0; s2 < 12; s2++) {
+	uint8_t *a = f + REAC_AUDIO_OFFSET;
+	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
 		int32_t v = (int32_t)(g_inj_amp * sin(g_inj_ph));
 		g_inj_ph += 2.0 * M_PI * g_inj_freq / 96000.0;
 		if (g_inj_ph > 2.0 * M_PI) g_inj_ph -= 2.0 * M_PI;
-		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
-		uint8_t *sp = a + base + s2 * (nch * 3);
-		if (g_inj_slot & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
-		else                { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+		braid_write(a, s2, g_inj_slot, nch, v);
 	}
 }
 static volatile unsigned long long g_met_n;     /* driver-level rx_packets of the OUT iface */
