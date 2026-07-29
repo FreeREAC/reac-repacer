@@ -441,7 +441,15 @@ static void inj_sine(uint8_t *f, int len) {
 		braid_write(a, s2, g_inj_slot, nch, v);
 	}
 }
-static volatile unsigned long long g_met_n;     /* driver-level rx_packets of the OUT iface */
+/* Cumulative REAC frame count on the CLOCK iface -- OUT by default, IN under
+ * --clock-source local-in. NOT the driver's rx_packets: clk_meter() below sums the
+ * deltas of the frame's own 16-bit counter field (bytes 14-15), so the count is what
+ * the sender EMITTED, not what we managed to read. That is the property the clock
+ * needs. Counting packets a userspace socket actually received is the thing that must
+ * never come back here: it undercounts on every drop and once paced an M-5000 4800 ppm
+ * slow. A counter delta cannot undercount that way -- a frame we never saw still
+ * advanced the counter, and the delta absorbs it at the next sample. */
+static volatile unsigned long long g_met_n;
 static volatile long long g_met_tlast;          /* when that count was read */
 
 static int open_iface(const char *name, struct iface *o) {
@@ -1124,8 +1132,14 @@ static int  ubus_setup(struct pacer_live *L) { (void)L; return -1; }
 static void ubus_service(int fd) { (void)fd; }
 #endif
 
-/* Print the full usage to the given stream. Listed defaults track the globals + the
- * main() locals below; every flag the parse loop understands appears here. */
+/* Print the usage to the given stream. Listed defaults track the globals + the main()
+ * locals below. This is the OPERATIONAL flag set -- the knobs a rig is deployed with.
+ * The parse loop also understands rig/diagnostic flags that are deliberately not
+ * advertised here (--bypass, --ctrl-bypass, --inject-sine, --inject-copy, --etf*,
+ * --period-ns, --detect-*, --mute-ms, --prio, --pll-fgain, --pll-pos-min, --no-plc,
+ * --no-auto-rate); reac-repacer(8) documents all of them. Keep spellings here IDENTICAL
+ * to the parse loop: a flag advertised under a name the parser does not accept is a
+ * hard exit for anyone who copies it. */
 static void usage(FILE *f) {
 	fprintf(f,
 "reac_repacer -- de-jitter / re-pacing relay for a Roland REAC stream over Wi-Fi/WDS.\n"
@@ -1169,8 +1183,9 @@ static void usage(FILE *f) {
 "  --pace-by-downstream   emit each upstream frame as a response to a downstream frame\n"
 "                         arriving on the wired OUT port (synchronous TDM, like a real\n"
 "                         stagebox: the desk provides rate AND phase)\n"
-"  --clock-margin-ms N    local mode: buffer movement (ms) that triggers a clock\n"
-"                         re-derive from the cumulative count (default 3)\n"
+"  --clock-margin-ppm N   wired clock modes: cumulative-rate change (ppm) that\n"
+"                         re-applies the emit period from the counted rate; also\n"
+"                         the lock margin (default 2, shipped UCI profile 8)\n"
 "  --cpu N                core to pin the real-time pacing thread to (default 3)\n"
 "\n"
 "Warm-start state:\n"
@@ -1237,6 +1252,18 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--lockfile") && i + 1 < argc) g_lockfile = argv[++i];
 		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
 		else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+		else if (!strcmp(argv[i], "--clock-margin-ms")) {
+			/* Named rejection for a spelling this usage() advertised but never parsed. The margin
+			 * is a threshold on the CUMULATIVE RATE estimate, so ppm is the only unit that
+			 * means the same thing at 44.1/48/96k; a millisecond figure would silently change
+			 * meaning with the sample rate. Say so rather than emit a bare "unknown option",
+			 * which is what sent operators looking for a knob that never existed. */
+			fprintf(stderr, "reac_repacer: there is no --clock-margin-ms; the clock margin is a\n"
+			                "  rate change in ppm (rate-independent), not a buffer movement in ms.\n"
+			                "  Use --clock-margin-ppm N instead (default 2).\n\n");
+			usage(stderr);
+			return 1;
+		}
 		else {
 			/* unknown flag (or a value-taking flag missing its argument): error to stderr,
 			 * show usage, and exit 1 -- never silently ignore it and launch with defaults. */
@@ -1825,11 +1852,12 @@ int main(int argc, char **argv) {
 			 * with WDS bursts and NEVER touches the clock -- no recovery warble, no ratchet. */
 			if (g_clock_local) {
 				/* THE clock calculation (operator-settled): period = elapsed time / total
-				 * frames, CUMULATIVE since the anchor frame, count from the driver's
-				 * lossless rx_packets. The window only grows, so precision improves ~1/T
-				 * without bound -- impossible to drift after a few thousand frames. The
-				 * anchor resets only on a real discontinuity (iface reset, stream stall,
-				 * sample-rate change). */
+				 * frames, CUMULATIVE since the anchor frame, from a LOSSLESS count -- here
+				 * the wire counter delta g_met_n carries (see clk_meter), which counts what
+				 * the sender emitted rather than what we read. The window only grows, so
+				 * precision improves ~1/T without bound -- impossible to drift after a few
+				 * thousand frames. The anchor resets only on a real discontinuity (iface
+				 * reset, stream stall, sample-rate change). */
 				int fresh = 0;
 				if (now - met_prev_t >= 1000000000LL) {
 					unsigned long long mn = g_met_n; long long mtl = g_met_tlast;

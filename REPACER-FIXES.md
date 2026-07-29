@@ -77,9 +77,14 @@ rate-dependent. Reloading on any master frame + decrementing per slot makes the
 matches the master side exactly. Offline-testable via the existing FSM-replay
 harness (doc "Offline validation" step 3).
 
-## P3 (rig-gated) — Clock-meter comment mislabels the mechanism
+## P3 (rig-gated) — Clock-meter comment mislabels the mechanism — **FIXED**
 **File:** `reac-repacer/tools/reac_repacer.c:381` (comment) + `:461-498`
 (`clk_meter`).
+
+**Fixed** by option (a): comment-only, clock path untouched. `g_met_n` and the
+cumulative-fit block now name the wire-counter delta, and both carry the reason
+raw socket counting must not come back (it undercounts on drops; it paced an
+M-5000 4800 ppm slow).
 
 **Current:** `g_met_n` is commented "driver-level rx_packets of the OUT iface",
 but `clk_meter` actually reads the REAC frame COUNTER field (bytes 14-15) off an
@@ -121,8 +126,11 @@ in-sequence path is already correct (every emitted frame is re-stamped
 monotonically at `:703` and flows through the ring); `--ctrl-bypass` is the one
 path that reproduces the forbidden two-frames-per-slot shape.
 
-## P5 (offline-safe) — usage() advertises a flag that doesn't exist
+## P5 (offline-safe) — usage() advertises a flag that doesn't exist — **FIXED**
 **File:** `reac-repacer/tools/reac_repacer.c:1061` (usage) vs `:1115` (parse).
+
+**Fixed** as proposed, plus a named rejection: `--clock-margin-ms` now exits with
+a message pointing at `--clock-margin-ppm` rather than a bare "unknown option".
 
 **Current:** `usage()` advertises
 `--clock-margin-ms N  local mode: buffer movement (ms)...`, but the parser

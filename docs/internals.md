@@ -141,11 +141,12 @@ tightly each side closes the phase loop, not in the overall shape.
   above the occupancy low-water mark.
 
 `prefill_ms` is **hot**: a `ubus set` or a Save & Apply retunes it on the next pacing
-tick with no dropout. `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` are hot too,
-but *only* hot — the init script does not pass them on the command line, so at launch
-the daemon uses its compiled defaults (6 / 120 / 20 ms and slots) and a UCI value for
-them takes effect on the first SIGHUP or `ubus set`. `adapt` itself is a **CLI-only
-flag**: the init never passes `--adapt`, so `option adapt '1'` in UCI has no effect.
+tick with no dropout. So are `adapt_min_ms` / `adapt_max_ms` / `adapt_margin`, and the
+init passes all three at launch as well, so a UCI value applies from the first start
+rather than from the first reload. `adapt` itself is a **launch parameter**: the init
+passes `--adapt` when `option adapt '1'` is set, but it is not one of the hot names, so
+switching the adaptive window on or off needs the daemon relaunched. Re-sizing it does
+not.
 
 ## Gap concealment (PLC)
 
@@ -246,8 +247,8 @@ period, per-port occupancy and counters, whether an occupancy retarget is in pro
 | `etf` | `--etf` | no | kernel time-based TX egress (needs the qdisc) |
 | `etf_delta_us` | (per-port `:µs`) | no | ETF early-release window |
 | `cpu` | `--cpu` | no | core for the `SCHED_FIFO` pacing thread |
-| (none) | `--adapt` | (flag) | auto-size the buffer to burst depth — **CLI only**, the init does not pass it |
-| `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` | same | **hot only** | adaptive-window floor / ceiling / headroom; not passed at launch |
+| `adapt` | `--adapt` | no | auto-size the buffer to burst depth (default off) |
+| `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` | same | **yes** | adaptive-window floor / ceiling / headroom |
 | `role` | — | — | fill marker (`ap`/`sta`) set by 97-reac-role |
 
 Debug and A/B flags exist too (`--bypass`, `--ctrl-bypass`, `--inject-sine`,

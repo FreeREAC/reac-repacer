@@ -20,6 +20,7 @@ ARGS=""
 
 build_args() {
 	local cpu prefill servo margin detect clock fwd bcast pll pace etf
+	local adapt amin amax amarg
 	config_get      cpu     main cpu                2
 	config_get      prefill main prefill_ms         30
 	config_get      servo   main servo_clamp_ppm    0
@@ -31,6 +32,15 @@ build_args() {
 	config_get_bool pll     main pll                1
 	config_get_bool pace    main pace_by_downstream 0
 	config_get_bool etf     main etf                0
+	# Adaptive window. The fallbacks are the daemon's own compiled defaults, so an
+	# absent key launches exactly as it did before these were passed at all. Passing
+	# the three bounds unconditionally is inert while adapt=0 (they only clamp the
+	# shared target inside the adapt path) and keeps the launch state equal to the UCI
+	# state, instead of the bounds appearing only at the first SIGHUP.
+	config_get_bool adapt   main adapt              0
+	config_get      amin    main adapt_min_ms       6
+	config_get      amax    main adapt_max_ms       120
+	config_get      amarg   main adapt_margin       20
 	[ -n "$clock" ] || clock=local
 
 	ARGS=""
@@ -39,7 +49,9 @@ build_args() {
 	[ "$pll"   = "1" ] && ARGS="$ARGS --pll"
 	[ "$pace"  = "1" ] && ARGS="$ARGS --pace-by-downstream"
 	[ "$etf"   = "1" ] && ARGS="$ARGS --etf"
+	[ "$adapt" = "1" ] && ARGS="$ARGS --adapt"
 	ARGS="$ARGS --clock-source $clock --servo-clamp-ppm $servo --clock-margin-ppm $margin --detect-ms $detect --prefill-ms $prefill --cpu $cpu"
+	ARGS="$ARGS --adapt-min-ms $amin --adapt-max-ms $amax --adapt-margin $amarg"
 
 	# port spec 'IN:OUT[:etf_delta_us]' — pass only IN:OUT to the daemon (the
 	# optional 3rd field is the per-port ETF window, consumed by setup_etf).
