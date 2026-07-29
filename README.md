@@ -15,12 +15,18 @@ cadence stalls. Wi-Fi delivers in bursts. `reac-repacer` sits at
 the receiving end, buffers the master broadcast a few milliseconds, and re-emits
 a constant cadence on a recovered clock to the local stagebox — so the stagebox
 stays locked. One daemon paces every REAC port on a single shared clock, so the
-boxes stay sample-aligned. Latency self-tunes down toward the link's clean floor
-by clock rate alone; frames are never dropped, so reducing latency does not
-click.
+boxes stay sample-aligned. Latency is moved by clock rate, never by dropping
+frames, so a latency change does not click — but the shipped profile
+(`servo_clamp_ppm=0`) **freezes** the output clock and holds latency where the
+prefill put it. Raising `servo_clamp_ppm` is what lets the buffer drain toward
+the link's clean floor; see [docs/internals.md](docs/internals.md).
 
-It does **not** decode REAC, reorder bytes, or tag VLANs — it relays whole L2
-frames. The VLAN trunk + gretap fabric is the separate
+It does **not** decode the REAC audio payload, reorder frames, or tag VLANs — it
+relays whole L2 frames. It does touch two things in the header: it re-stamps the
+16-bit frame counter (bytes 14–15) so its own output is one monotonic sequence,
+and it reads bytes 16–17 to tell a control frame from an audio frame. With gap
+concealment on (the default) it also *synthesises* a frame on underrun, a repeat
+of the last one under the next counter. The VLAN trunk + gretap fabric is the separate
 [reac-transport](https://github.com/FreeREAC/reac-transport) package; install
 both when the path crosses Wi-Fi.
 

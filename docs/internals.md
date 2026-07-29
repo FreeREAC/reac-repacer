@@ -16,7 +16,20 @@ cadence jitter as clicks and lock-flap.
 
 `reac-repacer` sits between the bursty link and the stagebox and **re-imposes the
 exact cadence the slave expects**, on a clean recovered clock. It does not decode
-REAC, reorder or alter bytes, or tag VLANs — it relays whole Layer-2 frames.
+the audio payload, reorder frames, or tag VLANs — it relays whole Layer-2 frames.
+
+It is not byte-transparent, though, and two places rely on that:
+
+- every emitted frame gets its **16-bit counter (bytes 14–15) re-stamped** from the
+  daemon's own monotonic `emit_ctr`, so the output is one contiguous sequence even
+  though the input had holes (`tools/reac_repacer.c:703-712`). A counter
+  discontinuity seen downstream of the re-pacer did not come from the wire.
+- **bytes 16–17 are read** to classify a frame as control vs audio
+  (`tools/reac_repacer.c:428`), because control frames occupy counter slots and
+  must ride the same cadence rather than jump ahead of it.
+
+See "Gap concealment" below for the third case, where the daemon emits a frame
+that never arrived at all.
 
 ## The de-jitter pipeline (per port)
 
@@ -53,8 +66,11 @@ By default the output clock is **steady and free-running** (`--no-steady` turns 
 off): the emit period runs at the detected base period and is *not* nudged per tick or
 per occupancy swing. This is what keeps short-term bursts out of the cadence — they
 show up as ring-depth swings, never as emit-timing jitter. (`clock_source` selects
-where the base reference comes from — the local crystal vs. the wired in-port frame
-count; the directional profile sets it per role, below.)
+where the base reference comes from — `wifi` = the occupancy PLL alone, `local` = the
+frame count on the wired **OUT** port, `local-in` = the frame count on the wired **IN**
+port, i.e. the mixer's rate. `wifi` is the daemon's compiled default, but the init
+always passes `--clock-source`, so on a router the effective value is whatever the
+directional profile below sets.)
 
 ## The PLL / drain servo
 
@@ -124,8 +140,26 @@ tightly each side closes the phase loop, not in the overall shape.
   (floor) and `adapt_max_ms` (ceiling), with `adapt_margin` slots of headroom kept
   above the occupancy low-water mark.
 
-These are **hot** parameters: a `ubus set` or a Save & Apply retunes them on the next
-pacing tick with no dropout.
+`prefill_ms` is **hot**: a `ubus set` or a Save & Apply retunes it on the next pacing
+tick with no dropout. `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` are hot too,
+but *only* hot — the init script does not pass them on the command line, so at launch
+the daemon uses its compiled defaults (6 / 120 / 20 ms and slots) and a UCI value for
+them takes effect on the first SIGHUP or `ubus set`. `adapt` itself is a **CLI-only
+flag**: the init never passes `--adapt`, so `option adapt '1'` in UCI has no effect.
+
+## Gap concealment (PLC)
+
+When the ring runs dry the pacer must still put a frame in the slot — a missed slot is
+exactly the stall the stagebox clicks on. Gap concealment is **on by default**
+(`--no-plc` turns it off) and repeats the last frame **under the next counter**
+(`tools/reac_repacer.c:686-699`). The verbatim repeat is deliberately not used: it
+would reuse a counter, which the slave reads as 65535 lost frames.
+
+So under a sustained underrun the stagebox receives audio that the master never sent.
+That is the intended trade — a repeated 12-sample block is inaudible where a stalled
+cadence is not — but it means "the box is locked and clicking-free" is not by itself
+evidence that the link delivered every frame. The per-port `underrun` and `plc`
+counters in `ubus call reac_repacer get` are what tell you how often it happened.
 
 ## Warm-start
 
@@ -202,19 +236,26 @@ period, per-port occupancy and counters, whether an occupancy retarget is in pro
 | `port` (list) | `--port IN:OUT[:µs]` | no | REAC zone(s); IN = tunnel, OUT = stagebox |
 | `prefill_ms` | `--prefill-ms` | **yes** | target buffer depth (ms) |
 | `servo_clamp_ppm` | `--servo-clamp-ppm` | **yes** | latency-reclaim clock-bias clamp; 0 = frozen clock |
-| `clock_margin_ppm` | — | no | PLL lock margin (ppm) |
+| `clock_margin_ppm` | `--clock-margin-ppm` | no | PLL lock margin (ppm) |
 | `detect_ms` | `--detect-ms` | no | rate-detection window (ms) |
 | `pll` | `--pll` | no | glacial frequency lock (null long-term drift) |
-| `clock_source` | `--clock-source` | no | base-clock reference (`local` / `local-in`) |
+| `clock_source` | `--clock-source` | no | base-clock reference (`wifi` / `local` / `local-in`) |
 | `pace_by_downstream` | `--pace-by-downstream` | no | drive the clock from downstream occupancy (AP) |
 | `forward_only` | `--forward-only` | no | de-jitter forward only; no return thread |
 | `bcast_only` | `--bcast-only` | no | accept only master-broadcast frames |
 | `etf` | `--etf` | no | kernel time-based TX egress (needs the qdisc) |
 | `etf_delta_us` | (per-port `:µs`) | no | ETF early-release window |
 | `cpu` | `--cpu` | no | core for the `SCHED_FIFO` pacing thread |
-| `adapt` | `--adapt` | (flag) | auto-size the buffer to burst depth |
-| `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` | same | **yes** | adaptive-window floor / ceiling / headroom |
+| (none) | `--adapt` | (flag) | auto-size the buffer to burst depth — **CLI only**, the init does not pass it |
+| `adapt_min_ms` / `adapt_max_ms` / `adapt_margin` | same | **hot only** | adaptive-window floor / ceiling / headroom; not passed at launch |
 | `role` | — | — | fill marker (`ap`/`sta`) set by 97-reac-role |
 
+Debug and A/B flags exist too (`--bypass`, `--ctrl-bypass`, `--inject-sine`,
+`--inject-copy`, `--period-ns`/`--no-auto-rate`). They are not UCI-reachable and must
+not ship enabled — `--ctrl-bypass` in particular deliberately breaks the
+one-frame-per-slot rule to reproduce the heartbeat click artifact.
+
 The shipped UCI defaults are the ear-validated rig values; the CLI defaults (in
-`man reac-repacer`) are the fallbacks when a flag is omitted.
+`man reac-repacer`) are the fallbacks when a flag is omitted. Where the two differ the
+init wins on a router, because it passes the UCI value explicitly — the notable case is
+`servo_clamp_ppm`, whose CLI default is 700 but which ships as `0` (frozen clock).
