@@ -324,15 +324,16 @@ section; it holds the global and hot parameters, and one
 .B list port
 entry per REAC zone. There are no separate per-port sections.
 .IP
-Not every UCI name reaches the daemon at launch:
+Every UCI name in the section reaches the daemon at launch, including
+.IR adapt ,
 .IR adapt_min_ms ,
 .IR adapt_max_ms
 and
-.I adapt_margin
-are read only on the SIGHUP / ubus path, so at startup the compiled defaults apply,
-and there is no UCI name for
-.BR \-\-adapt
-at all.
+.IR adapt_margin .
+The three bounds are additionally in the hot set, so they can be retuned on a
+running daemon;
+.I adapt
+is not, so switching the adaptive window on or off takes a relaunch.
 .SH EXAMPLES
 Three ports of one mixer with a 16 ms target depth:
 .PP
