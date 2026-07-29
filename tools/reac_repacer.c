@@ -441,7 +441,15 @@ static void inj_sine(uint8_t *f, int len) {
 		braid_write(a, s2, g_inj_slot, nch, v);
 	}
 }
-static volatile unsigned long long g_met_n;     /* driver-level rx_packets of the OUT iface */
+/* Cumulative REAC frame count on the CLOCK iface -- OUT by default, IN under
+ * --clock-source local-in. NOT the driver's rx_packets: clk_meter() below sums the
+ * deltas of the frame's own 16-bit counter field (bytes 14-15), so the count is what
+ * the sender EMITTED, not what we managed to read. That is the property the clock
+ * needs. Counting packets a userspace socket actually received is the thing that must
+ * never come back here: it undercounts on every drop and once paced an M-5000 4800 ppm
+ * slow. A counter delta cannot undercount that way -- a frame we never saw still
+ * advanced the counter, and the delta absorbs it at the next sample. */
+static volatile unsigned long long g_met_n;
 static volatile long long g_met_tlast;          /* when that count was read */
 
 static int open_iface(const char *name, struct iface *o) {
@@ -1844,11 +1852,12 @@ int main(int argc, char **argv) {
 			 * with WDS bursts and NEVER touches the clock -- no recovery warble, no ratchet. */
 			if (g_clock_local) {
 				/* THE clock calculation (operator-settled): period = elapsed time / total
-				 * frames, CUMULATIVE since the anchor frame, count from the driver's
-				 * lossless rx_packets. The window only grows, so precision improves ~1/T
-				 * without bound -- impossible to drift after a few thousand frames. The
-				 * anchor resets only on a real discontinuity (iface reset, stream stall,
-				 * sample-rate change). */
+				 * frames, CUMULATIVE since the anchor frame, from a LOSSLESS count -- here
+				 * the wire counter delta g_met_n carries (see clk_meter), which counts what
+				 * the sender emitted rather than what we read. The window only grows, so
+				 * precision improves ~1/T without bound -- impossible to drift after a few
+				 * thousand frames. The anchor resets only on a real discontinuity (iface
+				 * reset, stream stall, sample-rate change). */
 				int fresh = 0;
 				if (now - met_prev_t >= 1000000000LL) {
 					unsigned long long mn = g_met_n; long long mtl = g_met_tlast;
