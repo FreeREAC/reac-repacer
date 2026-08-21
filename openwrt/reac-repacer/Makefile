@@ -22,8 +22,10 @@ define Package/reac-repacer
   # reac-transport is a RUNTIME pairing (install both), not a package dep — they are
   # separate repos with independent builds, so coupling them via DEPENDS would break
   # standalone builds. Install reac-transport alongside this package when the REAC
-  # path crosses Wi-Fi.
-  DEPENDS:=+kmod-sched-core +tc-full +ip-full +libubus +libblobmsg-json
+  # path crosses Wi-Fi. libreac is a different case: it is a real BUILD dependency
+  # (the test-only inject paths take the frame geometry and the braid byte map from
+  # <reac/*.h>), so it belongs here.
+  DEPENDS:=+kmod-sched-core +tc-full +ip-full +libubus +libblobmsg-json +libreac
 endef
 
 define Package/reac-repacer/description
@@ -48,11 +50,13 @@ endef
 
 # -DHAVE_UBUS enables the live ubus control object (get stats / set hot params); without
 # it the daemon still builds + runs with SIGHUP-only live reconfig. On-device we link
-# libubus + libblobmsg_json (the get/set surface the LuCI depth slider drives).
+# libubus + libblobmsg_json (the get/set surface the LuCI depth slider drives), plus
+# libreac for the REAC frame geometry + braid oracle the inject paths use (the headers
+# come from the SDK staging dir, installed by libreac's Build/InstallDev).
 define Build/Compile
-	$(TARGET_CC) $(TARGET_CFLAGS) -std=c11 -O2 -pthread -DHAVE_UBUS \
+	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -std=c11 -O2 -pthread -DHAVE_UBUS \
 		-o $(PKG_BUILD_DIR)/reac-repacer $(PKG_BUILD_DIR)/reac_repacer.c \
-		-lubus -lblobmsg_json -lubox
+		-lubus -lblobmsg_json -lubox -lreac -lm
 endef
 
 define Package/reac-repacer/install

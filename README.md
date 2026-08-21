@@ -15,12 +15,18 @@ cadence stalls. Wi-Fi delivers in bursts. `reac-repacer` sits at
 the receiving end, buffers the master broadcast a few milliseconds, and re-emits
 a constant cadence on a recovered clock to the local stagebox — so the stagebox
 stays locked. One daemon paces every REAC port on a single shared clock, so the
-boxes stay sample-aligned. Latency self-tunes down toward the link's clean floor
-by clock rate alone; frames are never dropped, so reducing latency does not
-click.
+boxes stay sample-aligned. Latency is moved by clock rate, never by dropping
+frames, so a latency change does not click — but the shipped profile
+(`servo_clamp_ppm=0`) **freezes** the output clock and holds latency where the
+prefill put it. Raising `servo_clamp_ppm` is what lets the buffer drain toward
+the link's clean floor; see [docs/internals.md](docs/internals.md).
 
-It does **not** decode REAC, reorder bytes, or tag VLANs — it relays whole L2
-frames. The VLAN trunk + gretap fabric is the separate
+It does **not** decode the REAC audio payload, reorder frames, or tag VLANs — it
+relays whole L2 frames. It does touch two things in the header: it re-stamps the
+16-bit frame counter (bytes 14–15) so its own output is one monotonic sequence,
+and it reads bytes 16–17 to tell a control frame from an audio frame. With gap
+concealment on (the default) it also *synthesises* a frame on underrun, a repeat
+of the last one under the next counter. The VLAN trunk + gretap fabric is the separate
 [reac-transport](https://github.com/FreeREAC/reac-transport) package; install
 both when the path crosses Wi-Fi.
 
@@ -43,8 +49,27 @@ Builds an OpenWrt `.apk` against the latest stable OpenWrt SDK, in a container
     ./scripts/build.sh                          # latest stable, mediatek/filogic (e.g. GL-MT6000)
     OPENWRT_RELEASE=24.10.2 ./scripts/build.sh  # pin a release
     OPENWRT_TARGET=ramips/mt7621 ./scripts/build.sh
+    LIBREAC_REF=v0.4.0 ./scripts/build.sh       # pin the libreac it builds against
 
 The apks land in `.build/out/`; the SDK is downloaded once and cached.
+
+The one build dependency is [libreac](https://github.com/FreeREAC/libreac)
+(≥ 0.4.0), the shared REAC wire-format core: the frame geometry, the OHRCA `+2`
+trailer rule and the channel-pair braid oracle used by the test-only inject
+paths. The relay itself does not decode REAC and needs none of it. The build
+script clones libreac and stages its OpenWrt recipe alongside this one, so
+nothing extra is needed on the host; install libreac on the device from its own
+release. `reac-transport` is a separate matter — a *runtime* pairing, not a
+dependency.
+
+### Native build + tests
+
+    meson setup build && meson test -C build
+
+Uses the system `libreac-devel` when it is new enough, otherwise clones libreac
+as a meson subproject. The tests cover the frame geometry and pin the bytes the
+inject paths write against a golden fixture; the relay path is exercised on the
+rig, not here.
 
 ## Install
 

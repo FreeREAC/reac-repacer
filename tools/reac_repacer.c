@@ -85,6 +85,15 @@
 #include <linux/if_packet.h>
 #include <linux/if_ether.h>
 #include <linux/net_tstamp.h>
+
+/* libreac -- the shared REAC wire-format core. Used ONLY by the test-only inject
+ * paths below (--inject-sine / --inject-copy), which are the only code here that
+ * looks inside a frame; the relay stays byte-blind and needs none of it.
+ *   <reac/reac.h>        EtherType + frame geometry + the OHRCA +2 trailer rule
+ *   <reac/reac_braid.h>  the channel-pair byte map (the single layout oracle) */
+#include <reac/reac.h>
+#include <reac/reac_braid.h>
+
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
 #endif
@@ -313,6 +322,70 @@ static int g_pace_ds;   /* --pace-by-downstream: emit each upstream frame as a t
 static int32_t g_cpr[CPR_SZ];
 static volatile unsigned g_cpr_w, g_cpr_r;
 
+/* Channel width of a REAC audio frame, from its length on the wire -- the one
+ * home for the frame geometry the inject paths need. A REAC frame, in either
+ * direction, is REAC_UPSTREAM_OVERHEAD (52: the 50 B header plus the C2 EA end
+ * marker) + nch * REAC_UPSTREAM_BYTES_PER_CH (36 = 12 samples x 3 B), and an
+ * OHRCA fabric (M-5000/M-480, and the S-4000) appends a 2-byte CRC trailer after
+ * the end marker -- reac_frame_clean_len() strips it. nch is even: the braid
+ * packs channel PAIRS.
+ *
+ * Not libreac's reac_upstream_channels(), despite that being the same arithmetic:
+ * it rejects the 40-channel solution, because for a BOX RETURN 1492 B is the
+ * master's downstream broadcast and never a legal upstream. Both frames reach
+ * this code -- inj_copy_rx reads the desk's 40-channel downstream off the wired
+ * OUT port, and whether the emitted frames are box-width or the 40-ch broadcast
+ * depends on which side of the link the daemon sits on -- so the range accepted
+ * here is 2..40 inclusive.
+ *
+ * Returns -1 for anything that is not a legal REAC audio frame. The expression
+ * this replaced, (len - 50) / 36, never returned -1: an odd or off-grid width
+ * came back as a plausible-looking count, and a wrong nch is a wrong braid
+ * stride, which walks the last time-sample's writes past the audio region and
+ * into the end marker. (It did NOT, however, mis-count a trailered OHRCA frame:
+ * the truncating divide absorbs +2 at every legal width -- pinned in
+ * tests/test_geometry.c so the point is not re-litigated.) */
+static int frame_channels(int len)
+{
+	if (len < 0)
+		return -1;
+	size_t clean = reac_frame_clean_len((size_t)len);
+	if (clean < REAC_UPSTREAM_OVERHEAD ||
+	    (clean - REAC_UPSTREAM_OVERHEAD) % REAC_UPSTREAM_BYTES_PER_CH != 0)
+		return -1;
+	int nch = (int)((clean - REAC_UPSTREAM_OVERHEAD) / REAC_UPSTREAM_BYTES_PER_CH);
+	if (nch < 2 || nch > REAC_MAX_CHANNELS || (nch & 1))
+		return -1;
+	return nch;
+}
+
+/* One s24 sample of one channel slot, in or out of a frame's braided audio
+ * region. The byte map itself is reac_braid_pos() (<reac/reac_braid.h>),
+ * libreac's single layout oracle -- that header is explicit that no second copy
+ * of the map may exist, and this file used to carry three.
+ *
+ * Not reac_braid_encode(), libreac's whole-region encoder: it writes ALL nch
+ * channels of the region, and an injector overwrites exactly ONE slot and has to
+ * leave every other channel exactly as the desk or the box sent it. The
+ * per-position oracle is the right granularity for a slot patch; the
+ * whole-region one is for a builder that owns the frame it is filling. */
+static inline int32_t braid_read(const uint8_t *a, int s2, int ch, int nch)
+{
+	size_t pos[3];
+	reac_braid_pos(s2, ch, nch, pos);                       /* lo, mid, hi */
+	int32_t v = a[pos[0]] | (a[pos[1]] << 8) | (a[pos[2]] << 16);
+	return (v & 0x800000) ? v - (1 << 24) : v;              /* sign-extend bit 23 */
+}
+
+static inline void braid_write(uint8_t *a, int s2, int ch, int nch, int32_t v)
+{
+	size_t pos[3];
+	reac_braid_pos(s2, ch, nch, pos);
+	a[pos[0]] = (uint8_t)(v & 0xff);                        /* lo  */
+	a[pos[1]] = (uint8_t)((v >> 8) & 0xff);                 /* mid */
+	a[pos[2]] = (uint8_t)((v >> 16) & 0xff);                /* hi  */
+}
+
 static void *inj_copy_rx(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
 	while (recv(s->OUT.fd, buf, sizeof buf, MSG_DONTWAIT) > 0) ;
@@ -322,16 +395,12 @@ static void *inj_copy_rx(void *arg) {
 		if (n < 50) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;
 		uint8_t *r = buf; int len = (int)n;
-		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && r[16] == 0x88 && r[17] == 0x19) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
-		if (!(r[12] == 0x88 && r[13] == 0x19) || !(r[16] == 0 && r[17] == 0)) continue;
-		int nch = (len - 50) / 36; if (nch < 1 || g_cp_src >= nch) continue;
-		uint8_t *a = r + 50; int base = (g_cp_src & ~1) * 3;
-		for (int s2 = 0; s2 < 12; s2++) {
-			uint8_t *sp = a + base + s2 * (nch * 3);
-			uint8_t b0, b1, b2;
-			if (g_cp_src & 1) { b0 = sp[4]; b1 = sp[5]; b2 = sp[2]; }
-			else              { b0 = sp[3]; b1 = sp[0]; b2 = sp[1]; }
-			int32_t v = b0 | (b1 << 8) | (b2 << 16); if (v & 0x800000) v -= (1 << 24);
+		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && ((r[16] << 8) | r[17]) == REAC_ETHERTYPE) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
+		if (!reac_frame_is_reac(r, (size_t)len) || !(r[16] == 0 && r[17] == 0)) continue;
+		int nch = frame_channels(len); if (nch < 0 || g_cp_src >= nch) continue;
+		uint8_t *a = r + REAC_AUDIO_OFFSET;
+		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
+			int32_t v = braid_read(a, s2, g_cp_src, nch);
 			unsigned w = g_cpr_w;
 			g_cpr[w & (CPR_SZ - 1)] = v;
 			__atomic_store_n(&g_cpr_w, w + 1, __ATOMIC_RELEASE);
@@ -342,8 +411,8 @@ static void *inj_copy_rx(void *arg) {
 
 static void inj_copy(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;
-	int nch = (len - 50) / 36; if (nch < 1 || g_cp_dst >= nch) return;
-	uint8_t *a = f + 50; int base = (g_cp_dst & ~1) * 3;
+	int nch = frame_channels(len); if (nch < 0 || g_cp_dst >= nch) return;
+	uint8_t *a = f + REAC_AUDIO_OFFSET;
 	static int32_t last;
 	static int primed;
 	unsigned w0 = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
@@ -352,34 +421,35 @@ static void inj_copy(uint8_t *f, int len) {
 		if (w0 - g_cpr_r < 2048) return;
 		g_cpr_r = w0 - 2048; primed = 1;
 	}
-	for (int s2 = 0; s2 < 12; s2++) {
+	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
 		unsigned w = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
 		int32_t v = last;
 		if (w != g_cpr_r) { v = g_cpr[g_cpr_r & (CPR_SZ - 1)]; g_cpr_r++; last = v; }
-		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
-		uint8_t *sp = a + base + s2 * (nch * 3);
-		if (g_cp_dst & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
-		else              { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+		braid_write(a, s2, g_cp_dst, nch, v);
 	}
 }
 
 static void inj_sine(uint8_t *f, int len) {
 	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;          /* audio frames only */
-	int nch = (len - 50) / 36; if (nch < 1) return;
+	int nch = frame_channels(len); if (nch < 0) return;
 	if (g_inj_slot >= nch) return;
-	uint8_t *a = f + 50;
-	int base = (g_inj_slot & ~1) * 3;
-	for (int s2 = 0; s2 < 12; s2++) {
+	uint8_t *a = f + REAC_AUDIO_OFFSET;
+	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
 		int32_t v = (int32_t)(g_inj_amp * sin(g_inj_ph));
 		g_inj_ph += 2.0 * M_PI * g_inj_freq / 96000.0;
 		if (g_inj_ph > 2.0 * M_PI) g_inj_ph -= 2.0 * M_PI;
-		uint8_t b0 = v & 0xff, b1 = (v >> 8) & 0xff, b2 = (v >> 16) & 0xff;
-		uint8_t *sp = a + base + s2 * (nch * 3);
-		if (g_inj_slot & 1) { sp[4] = b0; sp[5] = b1; sp[2] = b2; }
-		else                { sp[3] = b0; sp[0] = b1; sp[1] = b2; }
+		braid_write(a, s2, g_inj_slot, nch, v);
 	}
 }
-static volatile unsigned long long g_met_n;     /* driver-level rx_packets of the OUT iface */
+/* Cumulative REAC frame count on the CLOCK iface -- OUT by default, IN under
+ * --clock-source local-in. NOT the driver's rx_packets: clk_meter() below sums the
+ * deltas of the frame's own 16-bit counter field (bytes 14-15), so the count is what
+ * the sender EMITTED, not what we managed to read. That is the property the clock
+ * needs. Counting packets a userspace socket actually received is the thing that must
+ * never come back here: it undercounts on every drop and once paced an M-5000 4800 ppm
+ * slow. A counter delta cannot undercount that way -- a frame we never saw still
+ * advanced the counter, and the delta absorbs it at the next sample. */
+static volatile unsigned long long g_met_n;
 static volatile long long g_met_tlast;          /* when that count was read */
 
 static int open_iface(const char *name, struct iface *o) {
@@ -1062,8 +1132,14 @@ static int  ubus_setup(struct pacer_live *L) { (void)L; return -1; }
 static void ubus_service(int fd) { (void)fd; }
 #endif
 
-/* Print the full usage to the given stream. Listed defaults track the globals + the
- * main() locals below; every flag the parse loop understands appears here. */
+/* Print the usage to the given stream. Listed defaults track the globals + the main()
+ * locals below. This is the OPERATIONAL flag set -- the knobs a rig is deployed with.
+ * The parse loop also understands rig/diagnostic flags that are deliberately not
+ * advertised here (--bypass, --ctrl-bypass, --inject-sine, --inject-copy, --etf*,
+ * --period-ns, --detect-*, --mute-ms, --prio, --pll-fgain, --pll-pos-min, --no-plc,
+ * --no-auto-rate); reac-repacer(8) documents all of them. Keep spellings here IDENTICAL
+ * to the parse loop: a flag advertised under a name the parser does not accept is a
+ * hard exit for anyone who copies it. */
 static void usage(FILE *f) {
 	fprintf(f,
 "reac_repacer -- de-jitter / re-pacing relay for a Roland REAC stream over Wi-Fi/WDS.\n"
@@ -1107,8 +1183,9 @@ static void usage(FILE *f) {
 "  --pace-by-downstream   emit each upstream frame as a response to a downstream frame\n"
 "                         arriving on the wired OUT port (synchronous TDM, like a real\n"
 "                         stagebox: the desk provides rate AND phase)\n"
-"  --clock-margin-ms N    local mode: buffer movement (ms) that triggers a clock\n"
-"                         re-derive from the cumulative count (default 3)\n"
+"  --clock-margin-ppm N   wired clock modes: cumulative-rate change (ppm) that\n"
+"                         re-applies the emit period from the counted rate; also\n"
+"                         the lock margin (default 2, shipped UCI profile 8)\n"
 "  --cpu N                core to pin the real-time pacing thread to (default 3)\n"
 "\n"
 "Warm-start state:\n"
@@ -1175,6 +1252,18 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--lockfile") && i + 1 < argc) g_lockfile = argv[++i];
 		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
 		else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
+		else if (!strcmp(argv[i], "--clock-margin-ms")) {
+			/* Named rejection for a spelling this usage() advertised but never parsed. The margin
+			 * is a threshold on the CUMULATIVE RATE estimate, so ppm is the only unit that
+			 * means the same thing at 44.1/48/96k; a millisecond figure would silently change
+			 * meaning with the sample rate. Say so rather than emit a bare "unknown option",
+			 * which is what sent operators looking for a knob that never existed. */
+			fprintf(stderr, "reac_repacer: there is no --clock-margin-ms; the clock margin is a\n"
+			                "  rate change in ppm (rate-independent), not a buffer movement in ms.\n"
+			                "  Use --clock-margin-ppm N instead (default 2).\n\n");
+			usage(stderr);
+			return 1;
+		}
 		else {
 			/* unknown flag (or a value-taking flag missing its argument): error to stderr,
 			 * show usage, and exit 1 -- never silently ignore it and launch with defaults. */
@@ -1763,11 +1852,12 @@ int main(int argc, char **argv) {
 			 * with WDS bursts and NEVER touches the clock -- no recovery warble, no ratchet. */
 			if (g_clock_local) {
 				/* THE clock calculation (operator-settled): period = elapsed time / total
-				 * frames, CUMULATIVE since the anchor frame, count from the driver's
-				 * lossless rx_packets. The window only grows, so precision improves ~1/T
-				 * without bound -- impossible to drift after a few thousand frames. The
-				 * anchor resets only on a real discontinuity (iface reset, stream stall,
-				 * sample-rate change). */
+				 * frames, CUMULATIVE since the anchor frame, from a LOSSLESS count -- here
+				 * the wire counter delta g_met_n carries (see clk_meter), which counts what
+				 * the sender emitted rather than what we read. The window only grows, so
+				 * precision improves ~1/T without bound -- impossible to drift after a few
+				 * thousand frames. The anchor resets only on a real discontinuity (iface
+				 * reset, stream stall, sample-rate change). */
 				int fresh = 0;
 				if (now - met_prev_t >= 1000000000LL) {
 					unsigned long long mn = g_met_n; long long mtl = g_met_tlast;

@@ -2,3 +2,9 @@
 /.build/
 
 reac-repacer-*.tar.gz
+
+# meson: build dir + fetched subprojects
+/build/
+/subprojects/libreac/
+/subprojects/packagecache/
+/subprojects/.wraplock
