@@ -72,6 +72,35 @@ port, i.e. the mixer's rate. `wifi` is the daemon's compiled default, but the in
 always passes `--clock-source`, so on a router the effective value is whatever the
 directional profile below sets.)
 
+### The deadline accumulates; it is never re-based on `now`
+
+The emit instant is an **absolute** deadline advanced by one period per tick
+(`deadline += period`, with the fractional nanoseconds carried in `dl_carry` so the
+average cadence is exactly the base period). `clock_nanosleep(CLOCK_MONOTONIC,
+TIMER_ABSTIME)` then sleeps *to* it. The only places the deadline is re-based on the
+current time are a deliberate re-lock: a detected rate change, and startup.
+
+This is load-bearing, not incidental. Writing `deadline = now + period` instead — the
+obvious-looking form — silently discards a slot on every late wake: the loop resumes
+from wherever it happened to wake rather than from where it should have been, so the
+lost time is never made up. The cost is a **frequency** error, not a jitter blip, and it
+scales with how often the machine is late. Measured on a sibling REAC pacer, that one
+substitution abandoned ~3.6 slots per second and put the wire **-526.7 ppm** off the
+master; accumulating the deadline absolutely brought the same rig to **-8.7 ppm** and
+took 66 ms out of end-to-end latency.
+
+**How to tell that failure from packet loss**, since both look like missing audio: read
+the REAC sequence counter. A **lost** frame leaves a gap in the counter. An **unrun
+slot** leaves the counter contiguous while the clock falls behind — 357,968 consecutive
+frames with counter delta exactly 1 across 356 holes in wall-clock time is a pacer that
+skipped, not a link that dropped. That is also why this daemon re-stamps its own output
+counter as one monotonic sequence: downstream, the counter then means *its* pacing, and
+the box's own `reac_rx: gaps=` counts what the link lost.
+
+Related, and worth not misreading: `tx_errors` is **zero** during established audio, and
+a high EAGAIN rate on the send path is a **teardown** artefact. Neither is evidence about
+a running stream, and neither is a rate error.
+
 ## The PLL / drain servo
 
 Two slow mechanisms keep the free-running clock correct without touching short-term
