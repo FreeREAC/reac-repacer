@@ -30,6 +30,31 @@ of the last one under the next counter. The VLAN trunk + gretap fabric is the se
 [reac-transport](https://github.com/FreeREAC/reac-transport) package; install
 both when the path crosses Wi-Fi.
 
+## When this is the right tool — and when it is not
+
+The job here is narrow and physical: **a hardware stagebox at the far end of a link that
+delivers in bursts.** A REAC slave recovers word clock from packet arrival cadence and
+has no jitter buffer, so it cannot absorb a Wi-Fi burst itself. Nothing else in the
+fabric can do that job for it — the cadence has to be re-imposed on the segment the box
+is on, by something sitting on that segment.
+
+It is **not** the tool for a rate or pace mismatch inside a host. A mixing graph running
+at one rate with a REAC wire at another is fixed in the host's audio adapter, where
+PipeWire's own resampler bridges the two paces (verified at a 192 kHz graph against a
+48 kHz wire). Putting a relay in that path adds a hop and fixes nothing. Likewise a host
+whose pacer drifts is fixed in its pacer — see the deadline rule in
+[docs/internals.md](docs/internals.md) — not by re-pacing its output afterwards.
+
+So: **wired gigabit path → you do not need this.** Wi-Fi, WDS, or any link that bursts,
+with real Roland boxes downstream → you do.
+
+**[?] Open, and it bounds how much of this daemon's tuning was ever necessary.** A host
+defect in the same rig discarded ~100 ms of audio at a time and sounds exactly like a
+bursty link. Both were in the path at once, and the Wi-Fi path has not been re-measured
+since the host side was fixed. Until it is, how much of the original Wi-Fi symptom was
+the link is unknown. [REPACING-FINDING-2026-08-21.md](REPACING-FINDING-2026-08-21.md)
+names the two counters that keep the causes separable.
+
 ## Sample rates
 
 REAC carries no rate field on the wire — the sample rate *is* the packet rate
