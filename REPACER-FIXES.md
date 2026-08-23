@@ -1,5 +1,21 @@
 # REPACER-FIXES.md
 
+> **Scope.** Most items below are against **reac-pw** sources
+> (`reac-pw/src/reac_fsm.h`, `reac_master.c`, `reac_pacer.c`), which live in their own
+> repository, [FreeREAC/reac-pw](https://github.com/FreeREAC/reac-pw). A fix list for
+> another repo's code, kept here, is a second place for that work to be tracked and the
+> one nobody building reac-pw will read. Items P4, P5 and P7 are this repo's; the rest
+> belong on reac-pw's tracker and should be moved there as they are actioned.
+>
+> **Not covered here, and it supersedes anything below about pacer drift:** the drift on
+> that pacer was neither the oscillator nor `sendto()`. It was the emit deadline being
+> re-based onto every late wake instead of accumulated, which abandoned about 3.6 slots a
+> second — 526.7 ppm, against 8.7 ppm once fixed. The counter is what tells the two apart:
+> a dropped frame gaps it, a skipped slot leaves it contiguous. See the deadline rule in
+> [docs/internals.md](docs/internals.md). Any EAGAIN or `tx_errors` figure quoted as
+> running-audio behaviour is a teardown measurement; `tx_errors` is zero on an established
+> stream.
+
 Prioritized fix list from reviewing `reac-repacer` (`tools/reac_repacer.c`,
 `pacer_probe.c`, `docs/internals.md`) and reac-pw's `reac_pacer.c` against the 5
 establishment/timing findings, plus the FSM code the pacer drives
