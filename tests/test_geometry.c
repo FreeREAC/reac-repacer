@@ -5,14 +5,18 @@
  *
  * Four things are pinned here, and the second one is a correction to the record.
  *
- * 1. Every legal REAC audio frame length maps to its channel width, clean or
- *    with the OHRCA +2 CRC trailer an M-5000/M-480 fabric appends: an S-0808's
- *    340/342, an S-1608's 628/630, an S-4000's 1204/1206, the master's 1492/1494
- *    downstream broadcast.
+ * 1. Every legal REAC audio frame length maps to its channel width, clean or with
+ *    two trailing bytes: an S-0808's 340/342, an S-1608's 628/630, an S-4000's
+ *    1204/1206, the master's 1492/1494 downstream broadcast. Those two bytes are
+ *    the low 16 bits of the frame's OWN Ethernet FCS, left by the capture path.
+ *    They are NOT an OHRCA fabric trailer and not a REAC field: 56 captures carry
+ *    them and 20 do not, they appear on non-OHRCA M-200 rigs and are absent from
+ *    OHRCA ones, and a genuine trailer cannot equal the frame's own FCS 115,000
+ *    consecutive times. libreac's REAC_FRAME_BYTES_OHRCA keeps the old name.
  *
- * 2. The OHRCA trailer never mis-counted channels under the expression this
+ * 2. The residue never mis-counted channels under the expression this
  *    replaced. `(len - 50) / 36` was reported as skipping the +2 strip and so
- *    computing the wrong width on an OHRCA fabric. It does skip the strip, but
+ *    computing the wrong width. It does skip the strip, but
  *    it cannot change the answer: the clean length is 52 + nch*36, so the divide
  *    sees 36*nch + 2, and the trailered one 36*nch + 4 — both truncate to nch,
  *    and it would take a trailer of 34 bytes or more to shift the quotient. This
@@ -50,7 +54,7 @@ static int old_channels(int len) { return (len - 50) / 36; }
 
 int main(void)
 {
-	/* 1 + 2: the whole legal domain, clean and OHRCA-trailered */
+	/* 1 + 2: the whole legal domain, clean and with FCS residue */
 	for (int nch = 2; nch <= 40; nch += 2) {
 		int clean = 52 + nch * 36;
 		CHK(frame_channels(clean) == nch);
