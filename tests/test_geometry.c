@@ -54,7 +54,7 @@ static int old_channels(int len) { return (len - 50) / 36; }
 
 int main(void)
 {
-	/* 1 + 2: the whole legal domain, clean and OHRCA-trailered */
+	/* 1 + 2: the whole legal domain, clean and with FCS residue */
 	for (int nch = 2; nch <= 40; nch += 2) {
 		int clean = 52 + nch * 36;
 		CHK(frame_channels(clean) == nch);
