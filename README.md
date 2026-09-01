@@ -49,11 +49,15 @@ So: **wired gigabit path → you do not need this.** Wi-Fi, WDS, or any link tha
 with real Roland boxes downstream → you do.
 
 **[?] Open, and it bounds how much of this daemon's tuning was ever necessary.** A host
-defect in the same rig discarded ~100 ms of audio at a time and sounds exactly like a
-bursty link. Both were in the path at once, and the Wi-Fi path has not been re-measured
-since the host side was fixed. Until it is, how much of the original Wi-Fi symptom was
-the link is unknown. [REPACING-FINDING-2026-08-21.md](REPACING-FINDING-2026-08-21.md)
-names the two counters that keep the causes separable.
+pacing an adapter at the wrong sample rate can discard ~100 ms of audio at a time, which
+sounds exactly like a bursty link — and can be in the path at the same time as a real
+Wi-Fi burst, so a symptom fixed by tuning this relay is not proof the link caused it.
+The two causes stay separable only by checking different counters: on the **host**, a
+guard-trim / dropped-frame counter that should read zero once the host's own adapter is
+paced correctly (a sustained trim there means the host, not the link, is the cause); on
+the **link**, this relay's own upstream gap counter, which counts frames that genuinely
+never arrived. A host that trims and a link that drops sound alike and are fixed in
+different places — check both before tuning this daemon further.
 
 ## Sample rates
 
