@@ -9,7 +9,7 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 T=$(mktemp -d); D="$T/reac-repacer-$V"; mkdir -p "$D"
 rsync -a --exclude '.git' --exclude 'build' --exclude 'subprojects/libreac' \
       "$ROOT/tools" "$ROOT/openwrt" "$ROOT/tests" "$ROOT/subprojects" "$ROOT/meson.build" \
-      "$ROOT/LICENSE" "$ROOT/README.md" "$ROOT/packaging" "$D/"
+      "$ROOT/LICENSE" "$ROOT/README.md" "$ROOT/BUILDING.md" "$ROOT/packaging" "$D/"
 tar -czf "$ROOT/reac-repacer-$V.tar.gz" -C "$T" "reac-repacer-$V"
 rm -rf "$T"
 echo "wrote $ROOT/reac-repacer-$V.tar.gz"
