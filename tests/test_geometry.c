@@ -70,7 +70,7 @@ int main(void)
 	CHK(frame_channels(1492) == 40 && frame_channels(1494) == 40);  /* master downstream */
 
 	/* 3: why libreac's upstream oracle is not the one called here */
-	CHK(reac_upstream_channels(1206) == 32);   /* it does strip the trailer */
+	CHK(reac_upstream_channels(1204) == 32);   /* a clean upstream width it knows */
 	CHK(reac_upstream_channels(1492) == -1);   /* ...but 40 ch is not an upstream */
 	CHK(reac_upstream_channels(1494) == -1);
 	CHK(frame_channels(1492) == 40);           /* and the inject paths must accept it */
