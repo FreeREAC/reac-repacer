@@ -13,3 +13,5 @@ jobs:
             exit 1
           fi
           echo "clean — no forbidden tokens"
+      - name: README carries no build command (they live in BUILDING.md)
+        run: python3 tests/readme_no_build.py README.md

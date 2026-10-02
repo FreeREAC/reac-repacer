@@ -15,3 +15,11 @@ test_geometry = executable('test-geometry',
   dependencies : repacer_deps,
   install : false)
 test('frame-geometry', test_geometry)
+
+# The README carries pitch + install; the build steps live in BUILDING.md.
+python3 = find_program('python3')
+readme_no_build = files('readme_no_build.py')
+test('readme-no-build-command', python3,
+  args : [readme_no_build, meson.project_source_root() / 'README.md'])
+test('readme-no-build-self-test', python3,
+  args : [readme_no_build, '--self-test'])
