@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* repace_conf -- the warm-start lock reader and the hot-parameter ranges of
- * reac-repacer (include/repace_conf.h). */
+/* repace_conf -- the warm-start lock reader, the `uci get` reply reader and the
+ * hot-parameter ranges of reac-repacer (include/repace_conf.h). */
+#include <limits.h>
 #include <string.h>
 
 #include "repace_conf.h"
@@ -29,6 +30,41 @@ void rp_hot_clamp(struct rp_hot *p, int margin_max)
 		p->servo_clamp_ppm = 0;
 	if (p->servo_clamp_ppm > RP_SERVO_CLAMP_PPM_MAX)
 		p->servo_clamp_ppm = RP_SERVO_CLAMP_PPM_MAX;
+}
+
+int rp_uci_int(const char *reply, size_t n, int cur)
+{
+	if (n == 0)
+		return cur;
+	const char *p = reply, *end = reply + n;
+	const char *lf = memchr(reply, '\n', n);
+	if (lf)
+		end = lf;
+	while (p < end && (*p == ' ' || *p == '\t'))
+		p++;
+	int neg = 0;
+	if (p < end && (*p == '+' || *p == '-')) {
+		neg = *p == '-';
+		p++;
+	}
+	if (p == end || *p < '0' || *p > '9')
+		return cur;
+	long long v = 0;
+	while (p < end && *p >= '0' && *p <= '9') {
+		v = v * 10 + (*p - '0');
+		if (v > (long long)INT_MAX + 1)
+			return cur;
+		p++;
+	}
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\r'))
+		p++;
+	if (p != end)
+		return cur;
+	if (neg)
+		v = -v;
+	if (v < INT_MIN || v > INT_MAX)
+		return cur;
+	return (int)v;
 }
 
 /* the standard period (ns) of one 12-sample frame at a rate label, 0 for none */
