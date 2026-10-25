@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* The warm-start lock reader, rp_lock_lookup() (src/repace_conf.c), on the
- * records the daemon writes and on two it used to misread:
+/* The hot-parameter ranges and the warm-start lock reader (src/repace_conf.c).
+ *
+ * rp_lock_lookup() is held on the records the daemon writes and on two it used
+ * to misread, and rp_hot_clamp() on a third case it used to get wrong:
  *
  * 1. A record's period is held to the standard period of the rate the daemon
  *    detected. The reader before this held it to the standard of the period's own
@@ -12,6 +14,8 @@
  *    took the first 15 bytes of it (sscanf "%15s"), so for the 15-byte port
  *    `abcdefghijklmno` the line `abcdefghijklmno125000 96000 0` read as that port
  *    with the period 125000.
+ * 3. An adaptive floor is held to the ceiling's range too, so the floor never
+ *    ends above the ceiling.
  */
 #include <stdio.h>
 #include <string.h>
@@ -73,6 +77,27 @@ int main(void)
 		CHK(rp_lock_lookup(big, RP_LOCK_MAX + 1, "lan1", 96000) == 0);
 	}
 	CHK(look("lan1 125000 88200\n", "lan1", 88200) == 0);  /* not a label the daemon detects */
+
+	/* the hot-parameter ranges, rp_hot_clamp(): each field held to its range */
+	{
+		struct rp_hot p = { 0, 0, 0, -1, -1 };
+		rp_hot_clamp(&p, 1984);
+		CHK(p.prefill_ms == 1 && p.adapt_min_ms == 1 && p.adapt_max_ms == 1 &&
+		    p.adapt_margin == 0 && p.servo_clamp_ppm == 0);
+		struct rp_hot q = { 5000, 6, 5000, 99999, 99999 };
+		rp_hot_clamp(&q, 1984);
+		CHK(q.prefill_ms == 1000 && q.adapt_min_ms == 6 && q.adapt_max_ms == 1000 &&
+		    q.adapt_margin == 1984 && q.servo_clamp_ppm == 50000);
+		struct rp_hot r = { 30, 120, 6, 20, 0 };
+		rp_hot_clamp(&r, 16320);
+		CHK(r.adapt_min_ms == 120 && r.adapt_max_ms == 120);   /* max raised to min */
+		/* 3: a floor past the ceiling's range. The clamp before this raised
+		 * adapt_max_ms to 2000 and then cut it to 1000, leaving the floor above
+		 * the ceiling (min 2000, max 1000). */
+		struct rp_hot s = { 30, 2000, 120, 20, 0 };
+		rp_hot_clamp(&s, 16320);
+		CHK(s.adapt_min_ms == 1000 && s.adapt_max_ms == 1000);
+	}
 
 	printf("test_conf: %d failures\n", fails);
 	return fails ? 1 : 0;

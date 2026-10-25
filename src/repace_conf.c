@@ -1,11 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* repace_conf -- the warm-start lock reader of reac-repacer
- * (include/repace_conf.h). */
+/* repace_conf -- the warm-start lock reader and the hot-parameter ranges of
+ * reac-repacer (include/repace_conf.h). */
 #include <string.h>
 
 #include "repace_conf.h"
+
+void rp_hot_clamp(struct rp_hot *p, int margin_max)
+{
+	if (p->prefill_ms < RP_PREFILL_MS_MIN)
+		p->prefill_ms = RP_PREFILL_MS_MIN;
+	if (p->prefill_ms > RP_PREFILL_MS_MAX)
+		p->prefill_ms = RP_PREFILL_MS_MAX;
+	if (p->adapt_min_ms < RP_ADAPT_MS_MIN)
+		p->adapt_min_ms = RP_ADAPT_MS_MIN;
+	if (p->adapt_min_ms > RP_ADAPT_MS_MAX)
+		p->adapt_min_ms = RP_ADAPT_MS_MAX;
+	if (p->adapt_max_ms > RP_ADAPT_MS_MAX)
+		p->adapt_max_ms = RP_ADAPT_MS_MAX;
+	if (p->adapt_max_ms < p->adapt_min_ms)
+		p->adapt_max_ms = p->adapt_min_ms;
+	if (p->adapt_margin < 0)
+		p->adapt_margin = 0;
+	if (p->adapt_margin > margin_max)
+		p->adapt_margin = margin_max;
+	if (p->servo_clamp_ppm < 0)
+		p->servo_clamp_ppm = 0;
+	if (p->servo_clamp_ppm > RP_SERVO_CLAMP_PPM_MAX)
+		p->servo_clamp_ppm = RP_SERVO_CLAMP_PPM_MAX;
+}
 
 /* the standard period (ns) of one 12-sample frame at a rate label, 0 for none */
 static long std_period(long rate_hz)
