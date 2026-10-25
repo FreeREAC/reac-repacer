@@ -1,0 +1,4 @@
+lan2# reac-repacer PLL warm-start lock -- per-port converged emit period.
+# <out_iface> <emit_period_ns> <rate_label_hz> <unix_epoch_saved>
+lan1 124867 96000 1749150000
+lan2 124929 96000 1749150000
