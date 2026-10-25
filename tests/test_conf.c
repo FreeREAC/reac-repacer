@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* The hot-parameter ranges and the warm-start lock reader (src/repace_conf.c).
+/* The hot-parameter ranges, the uci reply reader and the warm-start lock reader
+ * (src/repace_conf.c).
  *
  * rp_lock_lookup() is held on the records the daemon writes and on two it used
  * to misread, and rp_hot_clamp() on a third case it used to get wrong:
@@ -16,6 +17,7 @@
  *    with the period 125000.
  * 3. An adaptive floor is held to the ceiling's range too, so the floor never
  *    ends above the ceiling.
+ * 4. rp_uci_int() keeps the running value for a uci reply past an int.
  */
 #include <stdio.h>
 #include <string.h>
@@ -77,6 +79,23 @@ int main(void)
 		CHK(rp_lock_lookup(big, RP_LOCK_MAX + 1, "lan1", 96000) == 0);
 	}
 	CHK(look("lan1 125000 88200\n", "lan1", 88200) == 0);  /* not a label the daemon detects */
+
+	/* the reply of `uci -q get`, rp_uci_int(): the value, or the running one */
+	CHK(rp_uci_int("150\n", 4, 7) == 150);
+	CHK(rp_uci_int("150", 3, 7) == 150);
+	CHK(rp_uci_int("  -20\t\r\n", 8, 7) == -20);
+	CHK(rp_uci_int("+5\n", 3, 7) == 5);
+	CHK(rp_uci_int("", 0, 7) == 7);                      /* an absent option replies nothing */
+	CHK(rp_uci_int("\n", 1, 7) == 7);
+	CHK(rp_uci_int("12ms\n", 5, 7) == 7);
+	CHK(rp_uci_int("12\nzz\n", 6, 7) == 12);             /* the first line only */
+	CHK(rp_uci_int("2147483647\n", 11, 7) == 2147483647);
+	CHK(rp_uci_int("-2147483648\n", 12, 7) == -2147483647 - 1);
+	/* 4: past an int. The reader before this cast strtol's long to int, so
+	 * 4294967297 staged as 1 and 2147483648 as -2147483648. */
+	CHK(rp_uci_int("4294967297\n", 11, 7) == 7);
+	CHK(rp_uci_int("2147483648\n", 11, 7) == 7);
+	CHK(rp_uci_int("-2147483649\n", 12, 7) == 7);
 
 	/* the hot-parameter ranges, rp_hot_clamp(): each field held to its range */
 	{
