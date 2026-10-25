@@ -1,0 +1,17 @@
+Breaks the check of fuzz/fuzz_lock.c:177 (a period is held to the standard of its own nearest rate, not of the rate detected).
+Caught by the seed input "rate-96000-other-rate-period" of fuzz_lock.
+
+diff --git a/src/repace_conf.c b/src/repace_conf.c
+index 4ed9c78..7198519 100644
+--- a/src/repace_conf.c
++++ b/src/repace_conf.c
+@@ -137,7 +137,8 @@ long rp_lock_lookup(const char *text, size_t n, const char *port, long rate_hz)
+ 		long long per = digits(per_at, per_len), lab = digits(lab_at, lab_len);
+ 		if (per < 0 || lab != rate_hz)
+ 			continue;
+-		if (per < std - std / 20 || per > std + std / 20)
++		long own = per > 187500 ? (per > 261054 ? std_period(44100) : std_period(48000)) : std;
++		if (per < own - own / 20 || per > own + own / 20)
+ 			continue;
+ 		found = (long)per;                 /* the last matching record wins (newest appended) */
+ 	}

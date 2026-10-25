@@ -1,0 +1,16 @@
+Breaks the check of fuzz/fuzz_egress.c:138 (an odd slot is written at the bytes of the even channel of its pair).
+Caught by the seed input "s0808-audio-slot-3" of fuzz_egress.
+
+diff --git a/src/repace_wire.c b/src/repace_wire.c
+index dd25a10..65aa3b4 100644
+--- a/src/repace_wire.c
++++ b/src/repace_wire.c
+@@ -131,7 +131,7 @@ int rp_slot_write(uint8_t *f, size_t n, int slot, const int32_t v[12])
+ 	uint8_t *a = f + REAC_AUDIO_OFFSET;
+ 	for (int s = 0; s < REAC_SAMPLES_PER_PKT; s++) {
+ 		size_t pos[3];
+-		reac_braid_pos(s, slot, nch, pos);
++		reac_braid_pos(s, slot & ~1, nch, pos);
+ 		a[pos[0]] = (uint8_t)(v[s] & 0xff);                     /* lo  */
+ 		a[pos[1]] = (uint8_t)((v[s] >> 8) & 0xff);              /* mid */
+ 		a[pos[2]] = (uint8_t)((v[s] >> 16) & 0xff);             /* hi  */
