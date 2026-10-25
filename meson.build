@@ -43,6 +43,7 @@ libreac_dep = dependency('libreac',
 repace_inc = include_directories('include')
 repace_lib = static_library('repace',
   'src/repace_wire.c',
+  'src/repace_conf.c',
   include_directories : repace_inc,
   dependencies : libreac_dep)
 repace_dep = declare_dependency(link_with : repace_lib, include_directories : repace_inc)
