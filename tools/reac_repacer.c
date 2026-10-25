@@ -94,7 +94,7 @@
 #include <reac/reac.h>
 
 #include "repace_wire.h"     /* the frame readers + emit rewrites (src/repace_wire.c) */
-#include "repace_conf.h"     /* the warm-start lock reader (src/repace_conf.c) */
+#include "repace_conf.h"     /* the lock reader + hot-param ranges (src/repace_conf.c) */
 
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
@@ -137,8 +137,7 @@ static volatile sig_atomic_t got_hup = 0;   /* SIGHUP -> re-read UCI + apply hot
  * the one shared apply path (the glitch-free occupancy retarget for a depth change), and
  * publishes the applied values back for the ubus get reply. Plain ints written/read
  * word-atomically; reconf_gen is the single fence the loop polls. */
-struct hot_params { int prefill_ms, adapt_min_ms, adapt_max_ms, adapt_margin, servo_clamp_ppm; };
-static struct hot_params g_pending;                  /* staged by a trigger */
+static struct rp_hot g_pending;                  /* staged by a trigger */
 static volatile sig_atomic_t reconf_gen = 0;         /* bumped on each staged request */
 
 /* global config (identical for every port) */
@@ -765,17 +764,10 @@ struct pacer_live {
 	int    *retarget_ticks;      /* ticks remaining in the current depth ramp */
 };
 
-/* clamp the staged hot params to the same ranges the CLI/UCI accept, in place */
-static void hot_params_clamp(struct hot_params *p) {
-	if (p->prefill_ms < 1)    p->prefill_ms = 1;
-	if (p->prefill_ms > 1000) p->prefill_ms = 1000;       /* bounded by the ring (clamped again to occ_cap below) */
-	if (p->adapt_min_ms < 1)  p->adapt_min_ms = 1;
-	if (p->adapt_max_ms < p->adapt_min_ms) p->adapt_max_ms = p->adapt_min_ms;
-	if (p->adapt_max_ms > 1000) p->adapt_max_ms = 1000;
-	if (p->adapt_margin < 0)  p->adapt_margin = 0;
-	if (p->adapt_margin > RING_SZ - 64) p->adapt_margin = RING_SZ - 64;
-	if (p->servo_clamp_ppm < 0) p->servo_clamp_ppm = 0;
-	if (p->servo_clamp_ppm > 50000) p->servo_clamp_ppm = 50000;
+/* clamp the staged hot params to the same ranges the CLI/UCI accept, in place: the
+ * ranges of include/repace_conf.h, and the adaptive margin to this build's ring */
+static void hot_params_clamp(struct rp_hot *p) {
+	rp_hot_clamp(p, RING_SZ - 64);
 }
 
 /* The glitch-free occupancy retarget + hot-param apply. Called from the pacing loop when
@@ -796,8 +788,8 @@ static void hot_params_clamp(struct hot_params *p) {
 #define RETARGET_MAXPPM 2000.0   /* bias ceiling for the walk (~3.5 cents, transient): a
                                   * larger jump stretches the duration rather than exceed it,
                                   * keeping the glide inaudible */
-static void apply_hot_params(struct pacer_live *L, const struct hot_params *in) {
-	struct hot_params p = *in;
+static void apply_hot_params(struct pacer_live *L, const struct rp_hot *in) {
+	struct rp_hot p = *in;
 	hot_params_clamp(&p);
 
 	/* the non-depth hot params take effect immediately via their globals + derived locals */
@@ -873,7 +865,7 @@ static int uci_get_int(const char *opt, int cur) {
  * retarget, applied on the RT loop's next tick. */
 static volatile sig_atomic_t g_persist_req = 0;    /* RT -> housekeeper: persist the staged period */
 static long g_persist_period = 0;                  /* period (ns) to persist; word-atomic long */
-static struct hot_params g_uci_pending;            /* housekeeper -> RT: staged UCI hot params */
+static struct rp_hot g_uci_pending;            /* housekeeper -> RT: staged UCI hot params */
 static volatile sig_atomic_t uci_reconf_gen = 0;   /* bumped once g_uci_pending is fully written */
 static struct pacer_live *g_house_live;            /* published so the housekeeper can seed absent keys */
 
@@ -892,7 +884,7 @@ static void *housekeeper(void *arg) {
 		if (got_hup && g_house_live) {
 			got_hup = 0;
 			struct pacer_live *L = g_house_live;
-			struct hot_params p = {
+			struct rp_hot p = {
 				.prefill_ms      = uci_get_int("prefill_ms",      L->prefill_ms),
 				.adapt_min_ms    = uci_get_int("adapt_min_ms",    g_adapt_min_ms),
 				.adapt_max_ms    = uci_get_int("adapt_max_ms",    g_adapt_max_ms),
@@ -994,7 +986,7 @@ static int repacer_set_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_parse(set_policy, __SET_MAX, tb, blob_data(msg), blob_len(msg));
 
 	/* seed from the running values so an omitted key is left unchanged */
-	struct hot_params p = {
+	struct rp_hot p = {
 		.prefill_ms      = g_live ? g_live->prefill_ms : 0,
 		.adapt_min_ms    = g_adapt_min_ms,
 		.adapt_max_ms    = g_adapt_max_ms,

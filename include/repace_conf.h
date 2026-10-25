@@ -2,12 +2,37 @@
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
 /* repace_conf -- the texts reac-repacer reads besides its command line: the
- * warm-start lock it wrote on an earlier run. Every function here is pure: the
- * daemon opens the file and hands the bytes in. */
+ * warm-start lock it wrote on an earlier run; and the ranges a hot parameter is
+ * held to, from either trigger (SIGHUP or ubus set). Every function here is pure:
+ * the daemon opens the file and hands the bytes in. */
 #ifndef REPACE_CONF_H
 #define REPACE_CONF_H
 
 #include <stddef.h>
+
+/* The hot parameters: the ones a running daemon retunes without a restart. */
+struct rp_hot {
+	int prefill_ms;        /* target depth, ms */
+	int adapt_min_ms;      /* adaptive window floor, ms */
+	int adapt_max_ms;      /* adaptive window ceiling, ms */
+	int adapt_margin;      /* low-water headroom, slots */
+	int servo_clamp_ppm;   /* drain-servo clock-bias clamp, ppm */
+};
+
+/* The ranges a hot parameter is held to. adapt_max_ms is also at least
+ * adapt_min_ms; adapt_margin's ceiling is the ring's own (its slots less the 64 the
+ * pacer keeps free), which the daemon passes in, as the packaged builds size the
+ * ring differently. */
+#define RP_PREFILL_MS_MIN       1
+#define RP_PREFILL_MS_MAX       1000
+#define RP_ADAPT_MS_MIN         1
+#define RP_ADAPT_MS_MAX         1000
+#define RP_SERVO_CLAMP_PPM_MAX  50000
+
+/* Holds each field of *p to its range, in place: a value below the floor becomes
+ * the floor, one above the ceiling the ceiling; then adapt_max_ms is raised to
+ * adapt_min_ms when it is below it. adapt_margin is held to 0..margin_max. */
+void rp_hot_clamp(struct rp_hot *p, int margin_max);
 
 /* The warm-start lock, the file's n bytes. The daemon writes it, one record per
  * output port:
