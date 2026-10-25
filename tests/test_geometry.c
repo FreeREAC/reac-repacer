@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* frame_channels() — the frame geometry the inject paths run on.
+/* rp_frame_channels() — the frame geometry the inject paths run on.
  *
  * Four things are pinned here, and the second one is a correction to the record.
  *
@@ -49,7 +49,7 @@ static int fails;
 	if (!(cond)) { fails++; fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #cond); } \
 } while (0)
 
-/* the expression frame_channels() replaced, kept only so (2) can be asserted */
+/* the expression rp_frame_channels() replaced, kept only so (2) can be asserted */
 static int old_channels(int len) { return (len - 50) / 36; }
 
 int main(void)
@@ -57,36 +57,36 @@ int main(void)
 	/* 1 + 2: the whole legal domain, clean and with FCS residue */
 	for (int nch = 2; nch <= 40; nch += 2) {
 		int clean = 52 + nch * 36;
-		CHK(frame_channels(clean) == nch);
-		CHK(frame_channels(clean + 2) == nch);
+		CHK(rp_frame_channels(clean) == nch);
+		CHK(rp_frame_channels(clean + 2) == nch);
 		CHK(old_channels(clean) == nch);        /* the trailer never moved the count */
 		CHK(old_channels(clean + 2) == nch);
 	}
 
 	/* 1: the widths that exist on the rig, spelled out */
-	CHK(frame_channels(340) == 8   && frame_channels(342) == 8);    /* S-0808  */
-	CHK(frame_channels(628) == 16  && frame_channels(630) == 16);   /* S-1608  */
-	CHK(frame_channels(1204) == 32 && frame_channels(1206) == 32);  /* S-4000  */
-	CHK(frame_channels(1492) == 40 && frame_channels(1494) == 40);  /* master downstream */
+	CHK(rp_frame_channels(340) == 8   && rp_frame_channels(342) == 8);    /* S-0808  */
+	CHK(rp_frame_channels(628) == 16  && rp_frame_channels(630) == 16);   /* S-1608  */
+	CHK(rp_frame_channels(1204) == 32 && rp_frame_channels(1206) == 32);  /* S-4000  */
+	CHK(rp_frame_channels(1492) == 40 && rp_frame_channels(1494) == 40);  /* master downstream */
 
 	/* 3: why libreac's upstream oracle is not the one called here */
 	CHK(reac_upstream_channels(1204) == 32);   /* a clean upstream width it knows */
 	CHK(reac_upstream_channels(1492) == -1);   /* ...but 40 ch is not an upstream */
 	CHK(reac_upstream_channels(1494) == -1);
-	CHK(frame_channels(1492) == 40);           /* and the inject paths must accept it */
+	CHK(rp_frame_channels(1492) == 40);           /* and the inject paths must accept it */
 
 	/* 4: malformed lengths decline instead of producing a stride */
-	CHK(frame_channels(160) == -1);            /* 52 + 3*36: odd width, braid needs pairs */
-	CHK(frame_channels(200) == -1);            /* off the 36-byte grid */
-	CHK(frame_channels(50) == -1);             /* shorter than the overhead */
-	CHK(frame_channels(52) == -1);             /* header + marker, no audio */
-	CHK(frame_channels(1528) == -1);           /* 52 + 41*36: past the 40-ch ceiling */
-	CHK(frame_channels(-4) == -1);
+	CHK(rp_frame_channels(160) == -1);            /* 52 + 3*36: odd width, braid needs pairs */
+	CHK(rp_frame_channels(200) == -1);            /* off the 36-byte grid */
+	CHK(rp_frame_channels(50) == -1);             /* shorter than the overhead */
+	CHK(rp_frame_channels(52) == -1);             /* header + marker, no audio */
+	CHK(rp_frame_channels(1528) == -1);           /* 52 + 41*36: past the 40-ch ceiling */
+	CHK(rp_frame_channels(-4) == -1);
 
 	/* 4, made concrete: a 160-byte frame. old_channels() says 3 channels, so the
 	 * braid stride is 3*3 = 9 bytes and slot 2's twelfth sample writes at region
 	 * offset (2 & ~1)*3 + 11*9 + 3 = 108 — one past the 108-byte region, i.e. the
-	 * first byte of the C2 EA end marker. frame_channels() declines the frame, so
+	 * first byte of the C2 EA end marker. rp_frame_channels() declines the frame, so
 	 * inj_sine leaves it alone. */
 	{
 		uint8_t f[256];
