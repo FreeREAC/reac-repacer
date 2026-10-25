@@ -94,7 +94,7 @@
 #include <reac/reac.h>
 
 #include "repace_wire.h"     /* the frame readers + emit rewrites (src/repace_wire.c) */
-#include "repace_conf.h"     /* the lock reader + hot-param ranges (src/repace_conf.c) */
+#include "repace_conf.h"     /* the lock + uci readers, hot-param ranges (src/repace_conf.c) */
 
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
@@ -838,7 +838,8 @@ static void apply_hot_params(struct pacer_live *L, const struct rp_hot *in) {
 }
 
 /* SIGHUP path: re-read the HOT params from /etc/config/reac-repacer via the uci CLI
- * (always present under procd; avoids linking libuci) and stage them. Anything absent
+ * (always present under procd; avoids linking libuci) and stage them. Anything absent,
+ * or not an int (include/repace_conf.h, rp_uci_int),
  * keeps the running value (passed in via cur). Done from the non-RT housekeeper thread,
  * never the RT pacing loop or the signal handler -- popen() is a fork+exec of an
  * mlockall'd process and must never run on the SCHED_FIFO emit thread. */
@@ -846,10 +847,10 @@ static int uci_get_int(const char *opt, int cur) {
 	char cmd[160]; snprintf(cmd, sizeof cmd, "uci -q get reac-repacer.main.%s", opt);
 	FILE *f = popen(cmd, "r");
 	if (!f) return cur;
-	char buf[64]; int v = cur;
-	if (fgets(buf, sizeof buf, f)) { char *e; long n = strtol(buf, &e, 10); if (e != buf) v = (int)n; }
+	char buf[96];
+	size_t n = fread(buf, 1, sizeof buf, f);
 	pclose(f);
-	return v;
+	return rp_uci_int(buf, n, cur);   /* the reply's grammar: include/repace_conf.h */
 }
 /* ---- non-RT housekeeper: flash persistence + UCI reload, kept OFF the SCHED_FIFO emit
  * thread ----------------------------------------------------------------------------

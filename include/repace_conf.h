@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Pau Aliagas <linuxnow@gmail.com>
 
-/* repace_conf -- the texts reac-repacer reads besides its command line: the
- * warm-start lock it wrote on an earlier run; and the ranges a hot parameter is
- * held to, from either trigger (SIGHUP or ubus set). Every function here is pure:
- * the daemon opens the file and hands the bytes in. */
+/* repace_conf -- the two texts reac-repacer reads besides its command line: the
+ * warm-start lock it wrote on an earlier run, and the reply of `uci get` for a hot
+ * parameter on SIGHUP; and the ranges a hot parameter is held to, from either
+ * trigger (SIGHUP or ubus set). Every function here is pure: the daemon opens the
+ * file and runs uci, and hands the bytes in. */
 #ifndef REPACE_CONF_H
 #define REPACE_CONF_H
 
@@ -33,6 +34,13 @@ struct rp_hot {
  * the floor, one above the ceiling the ceiling; then adapt_max_ms is raised to
  * adapt_min_ms when it is below it. adapt_margin is held to 0..margin_max. */
 void rp_hot_clamp(struct rp_hot *p, int margin_max);
+
+/* The reply of `uci -q get reac-repacer.main.<option>`, n bytes. Its first line
+ * (up to the first LF, or all of it) is the value: optional spaces and tabs, an
+ * optional sign, one or more decimal digits, optional spaces, tabs or a CR, and
+ * nothing else. The value when it is that and fits an int; else `cur`, the running
+ * value (an absent option replies nothing). */
+int rp_uci_int(const char *reply, size_t n, int cur);
 
 /* The warm-start lock, the file's n bytes. The daemon writes it, one record per
  * output port:
