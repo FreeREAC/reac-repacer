@@ -1,0 +1,16 @@
+Breaks the check of fuzz/fuzz_wire.c:69 (the forward reader takes a frame whose REAC EtherType sits behind a VLAN tag).
+Caught by the seed input "s0808-audio-tagged" of fuzz_wire.
+
+diff --git a/src/repace_wire.c b/src/repace_wire.c
+index dd25a10..9b8c31a 100644
+--- a/src/repace_wire.c
++++ b/src/repace_wire.c
+@@ -35,7 +35,7 @@ int rp_fwd_class(const uint8_t *f, size_t n, int bcast_only)
+ {
+ 	if (n < 18)
+ 		return RP_FWD_DROP;
+-	if (!is_reac(f))
++	if (!is_reac(f) && !is_tagged_reac(f))
+ 		return RP_FWD_DROP;
+ 	if (bcast_only && f[0] != 0xff)
+ 		return RP_FWD_DROP;

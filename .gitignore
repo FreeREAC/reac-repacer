@@ -8,3 +8,5 @@ reac-repacer-*.tar.gz
 /subprojects/libreac/
 /subprojects/packagecache/
 /subprojects/.wraplock
+/build-fuzz/
+/fuzz/findings/

@@ -1,0 +1,16 @@
+Breaks the check of fuzz/fuzz_uci.c:154 (the adaptive floor is held at the bottom only, so it ends above the ceiling).
+Caught by the seed input "adapt-min-2000" of fuzz_uci.
+
+diff --git a/src/repace_conf.c b/src/repace_conf.c
+index 4ed9c78..d9d9c8b 100644
+--- a/src/repace_conf.c
++++ b/src/repace_conf.c
+@@ -16,8 +16,6 @@ void rp_hot_clamp(struct rp_hot *p, int margin_max)
+ 		p->prefill_ms = RP_PREFILL_MS_MAX;
+ 	if (p->adapt_min_ms < RP_ADAPT_MS_MIN)
+ 		p->adapt_min_ms = RP_ADAPT_MS_MIN;
+-	if (p->adapt_min_ms > RP_ADAPT_MS_MAX)
+-		p->adapt_min_ms = RP_ADAPT_MS_MAX;
+ 	if (p->adapt_max_ms > RP_ADAPT_MS_MAX)
+ 		p->adapt_max_ms = RP_ADAPT_MS_MAX;
+ 	if (p->adapt_max_ms < p->adapt_min_ms)
