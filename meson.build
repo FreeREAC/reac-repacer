@@ -38,7 +38,16 @@ libreac_dep = dependency('libreac',
   fallback : ['libreac', 'libreac_dep'],
   required : true)
 
-repacer_deps = [threads_dep, m_dep, libreac_dep]
+# The daemon's readers of wire and config bytes (src/, include/): pure functions the
+# daemon calls and the fuzz harnesses of fuzz/ drive (fuzz/README.md).
+repace_inc = include_directories('include')
+repace_lib = static_library('repace',
+  'src/repace_wire.c',
+  include_directories : repace_inc,
+  dependencies : libreac_dep)
+repace_dep = declare_dependency(link_with : repace_lib, include_directories : repace_inc)
+
+repacer_deps = [threads_dep, m_dep, libreac_dep, repace_dep]
 
 executable('reac-repacer',
   'tools/reac_repacer.c',

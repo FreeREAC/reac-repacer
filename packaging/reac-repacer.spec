@@ -29,7 +29,7 @@ without -DHAVE_UBUS). Needs iproute (tc/ip) at runtime.
 %build
 # Production ring size (the source ships the larger test ring).
 sed -i 's/^#define RING_BITS 14 .*/#define RING_BITS 11   \/* prod ring *\//' tools/reac_repacer.c
-cc %{optflags} -std=c11 -pthread -o reac-repacer tools/reac_repacer.c -lreac -lm
+cc %{optflags} -std=c11 -pthread -Iinclude -o reac-repacer tools/reac_repacer.c src/repace_*.c -lreac -lm
 
 %install
 install -Dm0755 reac-repacer %{buildroot}%{_bindir}/reac-repacer
