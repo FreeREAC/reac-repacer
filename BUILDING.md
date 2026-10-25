@@ -39,3 +39,12 @@ Uses the system `libreac-devel` when it is new enough, otherwise clones libreac
 as a meson subproject. The tests cover the frame geometry and pin the bytes the
 inject paths write against a golden fixture; the relay path is exercised on the
 rig, not here.
+
+## Fuzzing
+
+    make fuzz-libreac && make fuzz && make fuzz-records
+
+The readers of frame, lock and uci bytes (`src/`, `include/`) have libFuzzer
+harnesses under `fuzz/`, built by the top-level `Makefile` with clang into
+`build-fuzz/`; [fuzz/README.md](fuzz/README.md) says what each one checks, what
+has no harness, and every target.
