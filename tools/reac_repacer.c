@@ -94,6 +94,7 @@
 #include <reac/reac.h>
 
 #include "repace_wire.h"     /* the frame readers + emit rewrites (src/repace_wire.c) */
+#include "repace_conf.h"     /* the warm-start lock reader (src/repace_conf.c) */
 
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
@@ -585,20 +586,10 @@ static long lock_load(const char *out_name, long rate_hz) {
 	if (!g_warm_start) return 0;
 	FILE *f = fopen(g_lockfile, "r");
 	if (!f) return 0;
-	char line[160]; long found = 0;
-	while (fgets(line, sizeof line, f)) {
-		char *p = line; while (*p == ' ' || *p == '\t') p++;
-		if (*p == '#' || *p == '\n' || *p == '\0') continue;
-		char nm[IFNAMSIZ]; long per = 0, lab = 0; long long ts = 0;
-		if (sscanf(p, "%15s %ld %ld %lld", nm, &per, &lab, &ts) < 3) continue;
-		if (strcmp(nm, out_name)) continue;
-		if (lab != rate_hz) continue;                                  /* rate changed -> stale */
-		long std_per = (long)(1.0e9 / (double)(nearest_std_pps(1.0e9 / (double)per)) + 0.5);
-		if (per < std_per - std_per / 20 || per > std_per + std_per / 20) continue;  /* +/-5% sanity */
-		found = per;            /* last matching record wins (newest appended) */
-	}
+	static char text[RP_LOCK_MAX + 1];   /* one byte over: a longer file is no lock we wrote */
+	size_t n = fread(text, 1, sizeof text, f);
 	fclose(f);
-	return found;
+	return rp_lock_lookup(text, n, out_name, rate_hz);   /* the record grammar: include/repace_conf.h */
 }
 
 /* lock_save: rewrite the state file with the live converged period for every active port,
