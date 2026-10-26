@@ -112,18 +112,18 @@ static uint64_t copy_case(int nch, int trailer)
 	return h;
 }
 
-/* The read half of the braid — braid_read(), which inj_copy_rx drives on the
- * OUT-port frames — cannot be reached through the digests above: it lives behind
+/* The read half of the braid -- rp_slot_read(), which inj_copy_rx drives on the
+ * OUT-port frames -- cannot be reached through the digests above: it lives behind
  * a blocking AF_PACKET loop, and the goldens only pin what goes ONTO the wire.
  * It is pinned instead by inversion. The write map is already golden-pinned byte
- * for byte across the whole domain, so showing that braid_read recovers exactly
- * what braid_write placed, at every width and slot and over values that exercise
+ * for byte across the whole domain, so showing that rp_slot_read recovers exactly
+ * what rp_slot_write placed, at every width and slot and over values that exercise
  * both polarities and the bit-23 sign extension, pins the read map to the same
  * bytes. A read map that disagreed with the golden write map could not round-trip.
  */
 static void roundtrip_case(int nch, int *fails_out)
 {
-	/* zero, both polarities at ±1, full scale either side of the sign boundary,
+	/* zero, both polarities at +-1, full scale either side of the sign boundary,
 	 * quarter scale, and values that isolate each of the three bytes */
 	static const int32_t vec[REAC_SAMPLES_PER_PKT] = {
 		0, 1, -1, 0x7fffff, -0x800000, 0x400000, -0x400000,
@@ -132,16 +132,18 @@ static void roundtrip_case(int nch, int *fails_out)
 	uint8_t f[2048];
 
 	for (int slot = 0; slot < nch; slot++) {
-		(void)build_frame(f, nch, 0);
-		uint8_t *a = f + REAC_AUDIO_OFFSET;
-		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++)
-			braid_write(a, s2, slot, nch, vec[s2]);
+		int len = build_frame(f, nch, 0);
+		int32_t got[REAC_SAMPLES_PER_PKT];
+		if (!rp_slot_write(f, (size_t)len, slot, vec) || !rp_slot_read(f, (size_t)len, slot, got)) {
+			(*fails_out)++;
+			fprintf(stderr, "FAIL braid round-trip %d ch slot %d: declined\n", nch, slot);
+			continue;
+		}
 		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
-			int32_t got = braid_read(a, s2, slot, nch);
-			if (got != vec[s2]) {
+			if (got[s2] != vec[s2]) {
 				(*fails_out)++;
 				fprintf(stderr, "FAIL braid round-trip %d ch slot %d sample %d: "
-				        "%" PRId32 " != %" PRId32 "\n", nch, slot, s2, got, vec[s2]);
+				        "%" PRId32 " != %" PRId32 "\n", nch, slot, s2, got[s2], vec[s2]);
 			}
 		}
 	}

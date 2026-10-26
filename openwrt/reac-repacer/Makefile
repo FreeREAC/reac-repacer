@@ -41,11 +41,11 @@ define Package/reac-repacer/conffiles
 /etc/config/reac-repacer
 endef
 
-# The C source is vendored under ./src (populated from the repo's tools/ at
-# build time).
+# The C source is vendored under ./src (populated from the repo's tools/, src/ and
+# include/ at build time): the daemon and its readers of wire and config bytes.
 define Build/Prepare
 	mkdir -p $(PKG_BUILD_DIR)
-	$(CP) ./src/reac_repacer.c $(PKG_BUILD_DIR)/
+	$(CP) ./src/*.c ./src/*.h $(PKG_BUILD_DIR)/
 endef
 
 # -DHAVE_UBUS enables the live ubus control object (get stats / set hot params); without
@@ -55,7 +55,7 @@ endef
 # come from the SDK staging dir, installed by libreac's Build/InstallDev).
 define Build/Compile
 	$(TARGET_CC) $(TARGET_CFLAGS) $(TARGET_LDFLAGS) -std=c11 -O2 -pthread -DHAVE_UBUS \
-		-o $(PKG_BUILD_DIR)/reac-repacer $(PKG_BUILD_DIR)/reac_repacer.c \
+		-I$(PKG_BUILD_DIR) -o $(PKG_BUILD_DIR)/reac-repacer $(PKG_BUILD_DIR)/*.c \
 		-lubus -lblobmsg_json -lubox -lreac -lm
 endef
 

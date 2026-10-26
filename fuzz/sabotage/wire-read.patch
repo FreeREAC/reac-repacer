@@ -1,0 +1,16 @@
+Breaks the check of fuzz/fuzz_wire.c:229 (the slot reader reads a slot of a control frame).
+Caught by the seed input "s1608-ctrl-cdea" of fuzz_wire.
+
+diff --git a/src/repace_wire.c b/src/repace_wire.c
+index dd25a10..f8e0fe6 100644
+--- a/src/repace_wire.c
++++ b/src/repace_wire.c
+@@ -110,7 +110,7 @@ int rp_slot_width(const uint8_t *f, size_t n, int slot)
+
+ int rp_slot_read(const uint8_t *f, size_t n, int slot, int32_t v[12])
+ {
+-	int nch = rp_slot_width(f, n, slot);
++	int nch = (slot >= 0 && slot < rp_frame_channels((long)n)) ? rp_frame_channels((long)n) : -1;
+ 	if (nch < 0)
+ 		return 0;
+ 	const uint8_t *a = f + REAC_AUDIO_OFFSET;
