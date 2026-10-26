@@ -84,7 +84,7 @@ by a seed too (`fuzz/checks.awk`): a check no input reaches is a property nobody
 
 | Harness | Reader lines | Covered | Lines no input reaches |
 | --- | ---: | ---: | --- |
-| wire | 82 | 81 | `rp_slot_width`'s refusal of a short or control frame: the copy reader hands it only audio frames of 50 bytes or more (`fuzz_egress` reaches it) |
+| wire | 82 | 82 | |
 | egress | 45 | 44 | `rp_frame_channels`'s refusal of a negative length: the pacer's frames have none (`fuzz_wire` reaches it) |
 | lock | 64 | 64 | |
 | uci | 55 | 55 | |

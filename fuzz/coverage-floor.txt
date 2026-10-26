@@ -1,6 +1,6 @@
 # Covered reader lines each harness's seed corpus reaches (make fuzz-coverage, fuzz/coverage.sh).
 # A harness below its floor turns fuzz-coverage red. harness covered-lines
-wire 81
+wire 82
 egress 44
 lock 64
 uci 55
