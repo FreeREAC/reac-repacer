@@ -5,7 +5,7 @@
  * on one frame. The daemon reads a frame in five places (tools/reac_repacer.c):
  * the forward reader (rp_fwd_class), the return relay (rp_ret_accept), the
  * downstream listener (rp_ds_accept), the clock meter (rp_meter_counter) and the
- * inject-copy reader (rp_copy_untag, then rp_slot_read on the frame it keeps);
+ * inject-copy reader (rp_copy_untag, rp_slot_read on each frame and the one it keeps);
  * and the pacer seeds its output counter from a queued frame (rp_counter). The
  * width rule they share, rp_frame_channels, is checked on the frame's length.
  *
@@ -222,7 +222,9 @@ static __attribute__((noinline)) void check_read(const uint8_t *c, size_t len, i
 	 * mutant: src/repace_wire.c:106 `slot >= nch` -> `slot > nch`
 	 * input: s0808-audio-slot-8
 	 * mutant: src/repace_wire.c:106 `slot < 0 || ` -> ``
-	 * input: s0808-audio-slot-minus-1 */
+	 * input: s0808-audio-slot-minus-1
+	 * mutant: src/repace_wire.c:113 `rp_slot_width(f, n, slot)` -> `(slot >= 0 && slot < rp_frame_channels((long)n)) ? rp_frame_channels((long)n) : -1`
+	 * input: s1608-ctrl-cdea */
 	if (got != want)
 		abort();
 	for (int s = 0; s < W_SAMPLES; s++) {
@@ -266,10 +268,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 	check_meter(f, n);
 	check_counter(f, n);
 	check_width(n);
+	/* the reader's own rule, on every frame as it came, control frames included */
+	check_read(f, n, slot);
 
 	uint8_t *c = fuzz_dup(f, n);
 	size_t len = check_copy(c, f, n);
-	/* inj_copy_rx reads a slot only of a frame the copy reader kept */
+	/* inj_copy_rx reads a slot of a frame the copy reader kept */
 	if (len)
 		check_read(c, len, slot);
 	free(c);
