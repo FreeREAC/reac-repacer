@@ -16,6 +16,12 @@ test_geometry = executable('test-geometry',
   install : false)
 test('frame-geometry', test_geometry)
 
+test_conf = executable('test-conf',
+  'test_conf.c',
+  dependencies : repace_dep,
+  install : false)
+test('conf-readers', test_conf)
+
 # The README carries pitch + install; the build steps live in BUILDING.md.
 python3 = find_program('python3')
 readme_no_build = files('readme_no_build.py')

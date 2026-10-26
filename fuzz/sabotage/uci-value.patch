@@ -1,0 +1,25 @@
+Breaks the check of fuzz/fuzz_uci.c:130 (a reply past an int is cast to one).
+Caught by the seed input "prefill-4294967297" of fuzz_uci.
+
+diff --git a/src/repace_conf.c b/src/repace_conf.c
+index 4ed9c78..572b1dc 100644
+--- a/src/repace_conf.c
++++ b/src/repace_conf.c
+@@ -52,8 +52,6 @@ int rp_uci_int(const char *reply, size_t n, int cur)
+ 	long long v = 0;
+ 	while (p < end && *p >= '0' && *p <= '9') {
+ 		v = v * 10 + (*p - '0');
+-		if (v > (long long)INT_MAX + 1)
+-			return cur;
+ 		p++;
+ 	}
+ 	while (p < end && (*p == ' ' || *p == '\t' || *p == '\r'))
+@@ -62,8 +60,6 @@ int rp_uci_int(const char *reply, size_t n, int cur)
+ 		return cur;
+ 	if (neg)
+ 		v = -v;
+-	if (v < INT_MIN || v > INT_MAX)
+-		return cur;
+ 	return (int)v;
+ }
+ 

@@ -86,13 +86,15 @@
 #include <linux/if_ether.h>
 #include <linux/net_tstamp.h>
 
-/* libreac -- the shared REAC wire-format core. Used ONLY by the test-only inject
- * paths below (--inject-sine / --inject-copy), which are the only code here that
- * looks inside a frame; the relay stays byte-blind and needs none of it.
+/* libreac -- the shared REAC wire-format core. Used ONLY through src/repace_wire.c
+ * by the test-only inject paths below (--inject-sine / --inject-copy), which are the
+ * only code here that looks inside a frame's audio; the relay stays byte-blind.
  *   <reac/reac.h>        EtherType + frame geometry + the OHRCA +2 trailer rule
- *   <reac/reac_braid.h>  the channel-pair byte map (the single layout oracle) */
+ * Every byte this file reads from or writes into a frame goes through repace_wire. */
 #include <reac/reac.h>
-#include <reac/reac_braid.h>
+
+#include "repace_wire.h"     /* the frame readers + emit rewrites (src/repace_wire.c) */
+#include "repace_conf.h"     /* the lock + uci readers, hot-param ranges (src/repace_conf.c) */
 
 #ifndef SO_TXTIME
 #define SO_TXTIME 61
@@ -135,8 +137,7 @@ static volatile sig_atomic_t got_hup = 0;   /* SIGHUP -> re-read UCI + apply hot
  * the one shared apply path (the glitch-free occupancy retarget for a depth change), and
  * publishes the applied values back for the ubus get reply. Plain ints written/read
  * word-atomically; reconf_gen is the single fence the loop polls. */
-struct hot_params { int prefill_ms, adapt_min_ms, adapt_max_ms, adapt_margin, servo_clamp_ppm; };
-static struct hot_params g_pending;                  /* staged by a trigger */
+static struct rp_hot g_pending;                  /* staged by a trigger */
 static volatile sig_atomic_t reconf_gen = 0;         /* bumped on each staged request */
 
 /* global config (identical for every port) */
@@ -322,69 +323,12 @@ static int g_pace_ds;   /* --pace-by-downstream: emit each upstream frame as a t
 static int32_t g_cpr[CPR_SZ];
 static volatile unsigned g_cpr_w, g_cpr_r;
 
-/* Channel width of a REAC audio frame, from its length on the wire -- the one
- * home for the frame geometry the inject paths need. A REAC frame, in either
- * direction, is REAC_UPSTREAM_OVERHEAD (52: the 50 B header plus the C2 EA end
- * marker) + nch * REAC_UPSTREAM_BYTES_PER_CH (36 = 12 samples x 3 B), and an
- * OHRCA fabric (M-5000/M-480, and the S-4000) appends a 2-byte CRC trailer after
- * the end marker -- reac_frame_clean_len() strips it. nch is even: the braid
- * packs channel PAIRS.
- *
- * Not libreac's reac_upstream_channels(), despite that being the same arithmetic:
- * it rejects the 40-channel solution, because for a BOX RETURN 1492 B is the
- * master's downstream broadcast and never a legal upstream. Both frames reach
- * this code -- inj_copy_rx reads the desk's 40-channel downstream off the wired
- * OUT port, and whether the emitted frames are box-width or the 40-ch broadcast
- * depends on which side of the link the daemon sits on -- so the range accepted
- * here is 2..40 inclusive.
- *
- * Returns -1 for anything that is not a legal REAC audio frame. The expression
- * this replaced, (len - 50) / 36, never returned -1: an odd or off-grid width
- * came back as a plausible-looking count, and a wrong nch is a wrong braid
- * stride, which walks the last time-sample's writes past the audio region and
- * into the end marker. (It did NOT, however, mis-count a trailered OHRCA frame:
- * the truncating divide absorbs +2 at every legal width -- pinned in
- * tests/test_geometry.c so the point is not re-litigated.) */
-static int frame_channels(int len)
-{
-	if (len < 0)
-		return -1;
-	size_t clean = reac_frame_clean_len((size_t)len);
-	if (clean < REAC_UPSTREAM_OVERHEAD ||
-	    (clean - REAC_UPSTREAM_OVERHEAD) % REAC_UPSTREAM_BYTES_PER_CH != 0)
-		return -1;
-	int nch = (int)((clean - REAC_UPSTREAM_OVERHEAD) / REAC_UPSTREAM_BYTES_PER_CH);
-	if (nch < 2 || nch > REAC_MAX_CHANNELS || (nch & 1))
-		return -1;
-	return nch;
-}
-
-/* One s24 sample of one channel slot, in or out of a frame's braided audio
- * region. The byte map itself is reac_braid_pos() (<reac/reac_braid.h>),
- * libreac's single layout oracle -- that header is explicit that no second copy
- * of the map may exist, and this file used to carry three.
- *
- * Not reac_braid_encode(), libreac's whole-region encoder: it writes ALL nch
- * channels of the region, and an injector overwrites exactly ONE slot and has to
- * leave every other channel exactly as the desk or the box sent it. The
- * per-position oracle is the right granularity for a slot patch; the
- * whole-region one is for a builder that owns the frame it is filling. */
-static inline int32_t braid_read(const uint8_t *a, int s2, int ch, int nch)
-{
-	size_t pos[3];
-	reac_braid_pos(s2, ch, nch, pos);                       /* lo, mid, hi */
-	int32_t v = a[pos[0]] | (a[pos[1]] << 8) | (a[pos[2]] << 16);
-	return (v & 0x800000) ? v - (1 << 24) : v;              /* sign-extend bit 23 */
-}
-
-static inline void braid_write(uint8_t *a, int s2, int ch, int nch, int32_t v)
-{
-	size_t pos[3];
-	reac_braid_pos(s2, ch, nch, pos);
-	a[pos[0]] = (uint8_t)(v & 0xff);                        /* lo  */
-	a[pos[1]] = (uint8_t)((v >> 8) & 0xff);                 /* mid */
-	a[pos[2]] = (uint8_t)((v >> 16) & 0xff);                /* hi  */
-}
+/* The frame geometry and the braid byte map the inject paths need are
+ * rp_frame_channels() and rp_slot_read()/rp_slot_write() (src/repace_wire.c): the
+ * channel width from the length (2..40, clean or with the FCS residue; -1 for a
+ * frame that is not a legal REAC audio frame), and one channel slot's 12 s24
+ * samples through libreac's reac_braid_pos(), the single layout oracle.
+ * tests/test_geometry.c pins the width rule. */
 
 static void *inj_copy_rx(void *arg) {
 	struct stream *s = arg; uint8_t buf[SLOT_SZ];
@@ -392,17 +336,14 @@ static void *inj_copy_rx(void *arg) {
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-		if (n < 50) continue;
+		if (n < 0) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;
-		uint8_t *r = buf; int len = (int)n;
-		if (len > 21 && r[12] == 0x81 && r[13] == 0x00 && ((r[16] << 8) | r[17]) == REAC_ETHERTYPE) { memmove(r + 12, r + 16, (size_t)(len - 16)); len -= 4; }
-		if (!reac_frame_is_reac(r, (size_t)len) || !(r[16] == 0 && r[17] == 0)) continue;
-		int nch = frame_channels(len); if (nch < 0 || g_cp_src >= nch) continue;
-		uint8_t *a = r + REAC_AUDIO_OFFSET;
+		size_t len = rp_copy_untag(buf, (size_t)n);         /* untag + REAC audio frames only */
+		int32_t v[REAC_SAMPLES_PER_PKT];
+		if (!len || !rp_slot_read(buf, len, g_cp_src, v)) continue;
 		for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
-			int32_t v = braid_read(a, s2, g_cp_src, nch);
 			unsigned w = g_cpr_w;
-			g_cpr[w & (CPR_SZ - 1)] = v;
+			g_cpr[w & (CPR_SZ - 1)] = v[s2];
 			__atomic_store_n(&g_cpr_w, w + 1, __ATOMIC_RELEASE);
 		}
 	}
@@ -410,9 +351,8 @@ static void *inj_copy_rx(void *arg) {
 }
 
 static void inj_copy(uint8_t *f, int len) {
-	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;
-	int nch = frame_channels(len); if (nch < 0 || g_cp_dst >= nch) return;
-	uint8_t *a = f + REAC_AUDIO_OFFSET;
+	if (len < 0 || rp_slot_width(f, (size_t)len, g_cp_dst) < 0) return;
+	int32_t v[REAC_SAMPLES_PER_PKT];
 	static int32_t last;
 	static int primed;
 	unsigned w0 = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
@@ -423,23 +363,21 @@ static void inj_copy(uint8_t *f, int len) {
 	}
 	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
 		unsigned w = __atomic_load_n(&g_cpr_w, __ATOMIC_ACQUIRE);
-		int32_t v = last;
-		if (w != g_cpr_r) { v = g_cpr[g_cpr_r & (CPR_SZ - 1)]; g_cpr_r++; last = v; }
-		braid_write(a, s2, g_cp_dst, nch, v);
+		v[s2] = last;
+		if (w != g_cpr_r) { v[s2] = g_cpr[g_cpr_r & (CPR_SZ - 1)]; g_cpr_r++; last = v[s2]; }
 	}
+	rp_slot_write(f, (size_t)len, g_cp_dst, v);
 }
 
 static void inj_sine(uint8_t *f, int len) {
-	if (!(f[16] == 0 && f[17] == 0) || len < 50) return;          /* audio frames only */
-	int nch = frame_channels(len); if (nch < 0) return;
-	if (g_inj_slot >= nch) return;
-	uint8_t *a = f + REAC_AUDIO_OFFSET;
+	if (len < 0 || rp_slot_width(f, (size_t)len, g_inj_slot) < 0) return;   /* audio frames holding the slot */
+	int32_t v[REAC_SAMPLES_PER_PKT];
 	for (int s2 = 0; s2 < REAC_SAMPLES_PER_PKT; s2++) {
-		int32_t v = (int32_t)(g_inj_amp * sin(g_inj_ph));
+		v[s2] = (int32_t)(g_inj_amp * sin(g_inj_ph));
 		g_inj_ph += 2.0 * M_PI * g_inj_freq / 96000.0;
 		if (g_inj_ph > 2.0 * M_PI) g_inj_ph -= 2.0 * M_PI;
-		braid_write(a, s2, g_inj_slot, nch, v);
 	}
+	rp_slot_write(f, (size_t)len, g_inj_slot, v);
 }
 /* Cumulative REAC frame count on the CLOCK iface -- OUT by default, IN under
  * --clock-source local-in. NOT the driver's rx_packets: clk_meter() below sums the
@@ -482,10 +420,10 @@ static void *fwd_rx(void *arg) {
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->IN.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-		if (n < 18) continue;
+		if (n < 0) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* skip our own return TX */
-		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;        /* REAC ethertype */
-		if (g_bcast_only && buf[0] != 0xff) continue;               /* master broadcast only */
+		int cls = rp_fwd_class(buf, (size_t)n, g_bcast_only);      /* REAC; master broadcast only with --bcast-only */
+		if (cls == RP_FWD_DROP) continue;
 		s->g_in_frames++;                                           /* input frame rate (rate detect) */
 		/* ALL frame types ride ONE master counter sequence at a constant packet rate:
 		 * the control frames (cdea channel-map, cfea announce) occupy counter slots
@@ -495,7 +433,7 @@ static void *fwd_rx(void *arg) {
 		 * (--ctrl-bypass) puts those samples ahead of cadence: one click per control
 		 * frame. Default keeps every type IN SEQUENCE through the ring; in == out, so
 		 * latency stays flat even through a control burst. */
-		int is_ctrl = !(buf[16] == 0x00 && buf[17] == 0x00);
+		int is_ctrl = cls == RP_FWD_CTRL;
 		if (is_ctrl) {
 			s->n_ctrl++;
 			if (g_ctrl_bypass) {   /* A/B only: reproduces the heartbeat artifact */
@@ -519,9 +457,9 @@ static void *ret_relay(void *arg) {
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-		if (n < 14) continue;
+		if (n < 0) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;          /* never echo the master back -> no loop */
-		if (!(buf[12] == 0x88 && buf[13] == 0x19)) continue;        /* REAC frames (incl handshake) */
+		if (!rp_ret_accept(buf, (size_t)n)) continue;              /* REAC frames (incl handshake) */
 		if (sendto(s->IN.fd, buf, (size_t)n, 0, (struct sockaddr *)&s->IN.tx, sizeof s->IN.tx) < 0) s->n_reterr++;
 		else s->n_ret++;
 	}
@@ -557,9 +495,8 @@ static void *clk_meter(void *arg) {
 			ssize_t n = recvfrom(fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
 			if (n <= 0) break;
 			if (from.sll_pkttype == PACKET_OUTGOING) continue;
-			int eo = (n > 13 && buf[12] == 0x81 && buf[13] == 0x00) ? 16 : 12;
-			if (n < eo + 6 || !(buf[eo] == 0x88 && buf[eo + 1] == 0x19) || n < 1000) continue;
-			uint16_t c = buf[eo + 2] | (buf[eo + 3] << 8);
+			uint16_t c;
+			if (!rp_meter_counter(buf, (size_t)n, &c)) continue;   /* the counter of a REAC frame of 1000 B or more */
 			if (have) cum += (uint16_t)(c - lastc);
 			lastc = c; have = 1; g_met_n = cum; g_met_tlast = ns_now();
 			got = 1;
@@ -576,9 +513,9 @@ static void ds_emit_one(struct stream *s) {
 		s->n_underrun++;
 		if (s->have_last) {
 			memcpy(s->plc_buf, s->slot_buf[s->last_idx], s->slot_len[s->last_idx]);
-			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
-			if (g_mute_until && ns_now() < g_mute_until && s->plc_buf[16] == 0 && s->plc_buf[17] == 0 && s->slot_len[s->last_idx] > 18)
-				memset(s->plc_buf + 18, 0, s->slot_len[s->last_idx] - 18);
+			rp_restamp(s->plc_buf, s->emit_ctr);
+			if (g_mute_until && ns_now() < g_mute_until)
+				rp_mute(s->plc_buf, s->slot_len[s->last_idx]);
 			if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(s->plc_buf, s->slot_len[s->last_idx]);
 			if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(s->plc_buf, s->slot_len[s->last_idx]);
 			if (tx(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], &s->OUT.tx) < 0) s->n_txerr++;
@@ -588,10 +525,10 @@ static void ds_emit_one(struct stream *s) {
 		return;
 	}
 	uint8_t *f = s->slot_buf[head];
-	if (!s->have_last) s->emit_ctr = f[14] | (f[15] << 8);
-	f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;
-	if (g_mute_until && ns_now() < g_mute_until && f[16] == 0 && f[17] == 0 && s->slot_len[head] > 18)
-		memset(f + 18, 0, s->slot_len[head] - 18);
+	if (!s->have_last) s->emit_ctr = rp_counter(f);
+	rp_restamp(f, s->emit_ctr);
+	if (g_mute_until && ns_now() < g_mute_until)
+		rp_mute(f, s->slot_len[head]);
 	if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(f, s->slot_len[head]);
 	if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(f, s->slot_len[head]);
 	if (tx(s->OUT.fd, f, s->slot_len[head], &s->OUT.tx) < 0) s->n_txerr++;
@@ -616,10 +553,9 @@ static void *ds_pacer(void *arg) {
 	while (running) {
 		struct sockaddr_ll from; socklen_t fl = sizeof from;
 		ssize_t n = recvfrom(s->OUT.fd, buf, sizeof buf, 0, (struct sockaddr *)&from, &fl);
-		if (n < 18) continue;
+		if (n < 0) continue;
 		if (from.sll_pkttype == PACKET_OUTGOING) continue;
-		if (!((buf[12] == 0x88 && buf[13] == 0x19) ||
-		      (buf[12] == 0x81 && buf[13] == 0x00 && buf[16] == 0x88 && buf[17] == 0x19))) continue;
+		if (!rp_ds_accept(buf, (size_t)n)) continue;             /* REAC, untagged or VLAN-tagged */
 		g_ds_tns = ns_now();
 	}
 	return NULL;
@@ -649,20 +585,10 @@ static long lock_load(const char *out_name, long rate_hz) {
 	if (!g_warm_start) return 0;
 	FILE *f = fopen(g_lockfile, "r");
 	if (!f) return 0;
-	char line[160]; long found = 0;
-	while (fgets(line, sizeof line, f)) {
-		char *p = line; while (*p == ' ' || *p == '\t') p++;
-		if (*p == '#' || *p == '\n' || *p == '\0') continue;
-		char nm[IFNAMSIZ]; long per = 0, lab = 0; long long ts = 0;
-		if (sscanf(p, "%15s %ld %ld %lld", nm, &per, &lab, &ts) < 3) continue;
-		if (strcmp(nm, out_name)) continue;
-		if (lab != rate_hz) continue;                                  /* rate changed -> stale */
-		long std_per = (long)(1.0e9 / (double)(nearest_std_pps(1.0e9 / (double)per)) + 0.5);
-		if (per < std_per - std_per / 20 || per > std_per + std_per / 20) continue;  /* +/-5% sanity */
-		found = per;            /* last matching record wins (newest appended) */
-	}
+	static char text[RP_LOCK_MAX + 1];   /* one byte over: a longer file is no lock we wrote */
+	size_t n = fread(text, 1, sizeof text, f);
 	fclose(f);
-	return found;
+	return rp_lock_lookup(text, n, out_name, rate_hz);   /* the record grammar: include/repace_conf.h */
 }
 
 /* lock_save: rewrite the state file with the live converged period for every active port,
@@ -759,9 +685,9 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 		s->n_underrun++;
 		if (s->have_last) {
 			memcpy(s->plc_buf, s->slot_buf[s->last_idx], s->slot_len[s->last_idx]);
-			s->plc_buf[14] = s->emit_ctr & 0xFF; s->plc_buf[15] = (s->emit_ctr >> 8) & 0xFF;
-			if (g_mute_until && ns_now() < g_mute_until && s->plc_buf[16] == 0 && s->plc_buf[17] == 0 && s->slot_len[s->last_idx] > 18)
-				memset(s->plc_buf + 18, 0, s->slot_len[s->last_idx] - 18);
+			rp_restamp(s->plc_buf, s->emit_ctr);
+			if (g_mute_until && ns_now() < g_mute_until)
+				rp_mute(s->plc_buf, s->slot_len[s->last_idx]);
 			if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(s->plc_buf, s->slot_len[s->last_idx]);
 			if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(s->plc_buf, s->slot_len[s->last_idx]);
 			if (tx(s->OUT.fd, s->plc_buf, s->slot_len[s->last_idx], &s->OUT.tx) < 0) s->n_txerr++;
@@ -770,10 +696,10 @@ static int pace_one(struct stream *s, int *active, int eq_floor, int eq_done, in
 		}
 	} else {
 		uint8_t *f = s->slot_buf[head];
-		if (!s->have_last) s->emit_ctr = f[14] | (f[15] << 8);                /* seed the counter */
-		f[14] = s->emit_ctr & 0xFF; f[15] = (s->emit_ctr >> 8) & 0xFF;        /* own a monotonic output counter */
-		if (g_mute_until && ns_now() < g_mute_until && f[16] == 0 && f[17] == 0 && s->slot_len[head] > 18)
-			memset(f + 18, 0, s->slot_len[head] - 18);   /* transition mute: silence audio payload, keep link control */
+		if (!s->have_last) s->emit_ctr = rp_counter(f);                      /* seed the counter */
+		rp_restamp(f, s->emit_ctr);                                           /* own a monotonic output counter */
+		if (g_mute_until && ns_now() < g_mute_until)
+			rp_mute(f, s->slot_len[head]);   /* transition mute: silence audio payload, keep link control */
 		if (g_inj_slot >= 0 && s == &streams[0]) inj_sine(f, s->slot_len[head]);
 		if (g_cp_dst >= 0 && s == &streams[0]) inj_copy(f, s->slot_len[head]);
 		if (tx(s->OUT.fd, f, s->slot_len[head], &s->OUT.tx) < 0) s->n_txerr++;
@@ -838,17 +764,10 @@ struct pacer_live {
 	int    *retarget_ticks;      /* ticks remaining in the current depth ramp */
 };
 
-/* clamp the staged hot params to the same ranges the CLI/UCI accept, in place */
-static void hot_params_clamp(struct hot_params *p) {
-	if (p->prefill_ms < 1)    p->prefill_ms = 1;
-	if (p->prefill_ms > 1000) p->prefill_ms = 1000;       /* bounded by the ring (clamped again to occ_cap below) */
-	if (p->adapt_min_ms < 1)  p->adapt_min_ms = 1;
-	if (p->adapt_max_ms < p->adapt_min_ms) p->adapt_max_ms = p->adapt_min_ms;
-	if (p->adapt_max_ms > 1000) p->adapt_max_ms = 1000;
-	if (p->adapt_margin < 0)  p->adapt_margin = 0;
-	if (p->adapt_margin > RING_SZ - 64) p->adapt_margin = RING_SZ - 64;
-	if (p->servo_clamp_ppm < 0) p->servo_clamp_ppm = 0;
-	if (p->servo_clamp_ppm > 50000) p->servo_clamp_ppm = 50000;
+/* clamp the staged hot params to the same ranges the CLI/UCI accept, in place: the
+ * ranges of include/repace_conf.h, and the adaptive margin to this build's ring */
+static void hot_params_clamp(struct rp_hot *p) {
+	rp_hot_clamp(p, RING_SZ - 64);
 }
 
 /* The glitch-free occupancy retarget + hot-param apply. Called from the pacing loop when
@@ -869,8 +788,8 @@ static void hot_params_clamp(struct hot_params *p) {
 #define RETARGET_MAXPPM 2000.0   /* bias ceiling for the walk (~3.5 cents, transient): a
                                   * larger jump stretches the duration rather than exceed it,
                                   * keeping the glide inaudible */
-static void apply_hot_params(struct pacer_live *L, const struct hot_params *in) {
-	struct hot_params p = *in;
+static void apply_hot_params(struct pacer_live *L, const struct rp_hot *in) {
+	struct rp_hot p = *in;
 	hot_params_clamp(&p);
 
 	/* the non-depth hot params take effect immediately via their globals + derived locals */
@@ -919,7 +838,8 @@ static void apply_hot_params(struct pacer_live *L, const struct hot_params *in) 
 }
 
 /* SIGHUP path: re-read the HOT params from /etc/config/reac-repacer via the uci CLI
- * (always present under procd; avoids linking libuci) and stage them. Anything absent
+ * (always present under procd; avoids linking libuci) and stage them. Anything absent,
+ * or not an int (include/repace_conf.h, rp_uci_int),
  * keeps the running value (passed in via cur). Done from the non-RT housekeeper thread,
  * never the RT pacing loop or the signal handler -- popen() is a fork+exec of an
  * mlockall'd process and must never run on the SCHED_FIFO emit thread. */
@@ -927,10 +847,10 @@ static int uci_get_int(const char *opt, int cur) {
 	char cmd[160]; snprintf(cmd, sizeof cmd, "uci -q get reac-repacer.main.%s", opt);
 	FILE *f = popen(cmd, "r");
 	if (!f) return cur;
-	char buf[64]; int v = cur;
-	if (fgets(buf, sizeof buf, f)) { char *e; long n = strtol(buf, &e, 10); if (e != buf) v = (int)n; }
+	char buf[96];
+	size_t n = fread(buf, 1, sizeof buf, f);
 	pclose(f);
-	return v;
+	return rp_uci_int(buf, n, cur);   /* the reply's grammar: include/repace_conf.h */
 }
 /* ---- non-RT housekeeper: flash persistence + UCI reload, kept OFF the SCHED_FIFO emit
  * thread ----------------------------------------------------------------------------
@@ -946,7 +866,7 @@ static int uci_get_int(const char *opt, int cur) {
  * retarget, applied on the RT loop's next tick. */
 static volatile sig_atomic_t g_persist_req = 0;    /* RT -> housekeeper: persist the staged period */
 static long g_persist_period = 0;                  /* period (ns) to persist; word-atomic long */
-static struct hot_params g_uci_pending;            /* housekeeper -> RT: staged UCI hot params */
+static struct rp_hot g_uci_pending;            /* housekeeper -> RT: staged UCI hot params */
 static volatile sig_atomic_t uci_reconf_gen = 0;   /* bumped once g_uci_pending is fully written */
 static struct pacer_live *g_house_live;            /* published so the housekeeper can seed absent keys */
 
@@ -965,7 +885,7 @@ static void *housekeeper(void *arg) {
 		if (got_hup && g_house_live) {
 			got_hup = 0;
 			struct pacer_live *L = g_house_live;
-			struct hot_params p = {
+			struct rp_hot p = {
 				.prefill_ms      = uci_get_int("prefill_ms",      L->prefill_ms),
 				.adapt_min_ms    = uci_get_int("adapt_min_ms",    g_adapt_min_ms),
 				.adapt_max_ms    = uci_get_int("adapt_max_ms",    g_adapt_max_ms),
@@ -1067,7 +987,7 @@ static int repacer_set_cb(struct ubus_context *ctx, struct ubus_object *obj,
 	blobmsg_parse(set_policy, __SET_MAX, tb, blob_data(msg), blob_len(msg));
 
 	/* seed from the running values so an omitted key is left unchanged */
-	struct hot_params p = {
+	struct rp_hot p = {
 		.prefill_ms      = g_live ? g_live->prefill_ms : 0,
 		.adapt_min_ms    = g_adapt_min_ms,
 		.adapt_max_ms    = g_adapt_max_ms,

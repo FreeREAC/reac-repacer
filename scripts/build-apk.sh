@@ -67,6 +67,7 @@ if [ -d "$REPO/openwrt/reac-repacer" ] && [ -f "$REPO/tools/reac_repacer.c" ]; t
   mkdir -p package/reac-repacer/src package/reac-repacer/files
   cp "$REPO/openwrt/reac-repacer/Makefile" package/reac-repacer/Makefile
   cp "$REPO"/tools/reac_repacer.c package/reac-repacer/src/reac_repacer.c
+  cp "$REPO"/src/repace_*.c "$REPO"/include/repace_*.h package/reac-repacer/src/
   sed -i 's/^#define RING_BITS 14 .*/#define RING_BITS 11   \/* PROD ring (patched from test=14 by build-apk.sh) *\//' package/reac-repacer/src/reac_repacer.c
   grep -q '^#define RING_BITS 11' package/reac-repacer/src/reac_repacer.c || { echo "ERROR: RING_BITS patch failed"; exit 1; }
   cp "$REPO"/openwrt/files/reac-repacer.config "$REPO"/openwrt/files/reac-repacer.init package/reac-repacer/files/

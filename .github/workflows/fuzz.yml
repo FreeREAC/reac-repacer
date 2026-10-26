@@ -1,0 +1,74 @@
+name: fuzz
+
+# The libFuzzer harnesses of fuzz/ (fuzz/README.md), on every push and pull request: the readers of frames off the
+# wire, the rewrite of a frame the pacer emits, the warm-start lock and the uci reply, each built with clang under
+# AddressSanitizer and UndefinedBehaviorSanitizer and fuzzed for 60 s from its seed corpus; every patch of
+# fuzz/sabotage/ found at the check it names; every check's own record met; the coverage witness held to its floor; the
+# corpus current; and each harness linked fully static. An input that crashes a harness is uploaded as the
+# fuzz-findings artifact. The readers call into libreac, which `make fuzz-libreac` clones at the tag the Makefile pins.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    name: fuzz the frame, lock and uci readers
+    runs-on: ubuntu-latest
+    # a backstop: fuzz-run spends 60 s on each harness and fuzz-sabotage runs seeds only, so the job ends well inside it
+    timeout-minutes: 30
+    container:
+      image: fedora:44
+    steps:
+      - name: Install clang, libFuzzer, llvm-cov and the static libc
+        run: |
+          dnf install -y --setopt=install_weak_deps=False --setopt=retries=10 git clang compiler-rt llvm make gawk \
+            diffutils glibc-static
+
+      - uses: actions/checkout@v4
+
+      # fuzz-sabotage applies each patch with git and restores it with git checkout
+      - name: Let git work in the checkout
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Get libreac at the pinned tag
+        run: make fuzz-libreac
+
+      - name: Build the harnesses (clang, libFuzzer, ASan, UBSan)
+        run: make fuzz
+
+      - name: The seed corpus is what the generator writes
+        run: make fuzz-corpus-check
+
+      - name: Fuzz each harness for 60 s
+        run: make fuzz-run FUZZ_TIME=60
+
+      # a property no bug can break checks nothing: each patch must make its harness abort on the seed it names, in the
+      # check it names
+      - name: Find every patch, each at its own check
+        run: make fuzz-sabotage
+
+      # every check of fuzz/ records the one-line bug it catches and the seed it catches it on, and each record, alone,
+      # makes that check abort on that seed
+      - name: Meet every check's record
+        run: make fuzz-records
+
+      # the seed corpus must keep reaching the reader lines it reaches today (fuzz/coverage-floor.txt) and every
+      # property check of every harness
+      - name: Hold the coverage floor
+        run: make fuzz-coverage
+
+      - name: Each harness linked fully static, over its corpus
+        run: make fuzz-static
+
+      - name: Upload the crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: fuzz/findings/
+          if-no-files-found: ignore

@@ -1,0 +1,2 @@
+# the seed corpus is bytes, not text to diff
+fuzz/corpus/** binary
