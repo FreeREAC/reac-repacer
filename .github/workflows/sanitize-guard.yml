@@ -15,3 +15,7 @@ jobs:
           echo "clean — no forbidden tokens"
       - name: README carries no build command (they live in BUILDING.md)
         run: python3 tests/readme_no_build.py README.md
+      - name: Every package of a release states one version
+        run: |
+          python3 tests/one_version.py --self-test
+          python3 tests/one_version.py

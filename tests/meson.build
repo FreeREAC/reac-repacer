@@ -29,3 +29,10 @@ test('readme-no-build-command', python3,
   args : [readme_no_build, meson.project_source_root() / 'README.md'])
 test('readme-no-build-self-test', python3,
   args : [readme_no_build, '--self-test'])
+
+# One release, one version: meson, the spec and both OpenWrt recipes.
+one_version = files('one_version.py')
+test('one-version', python3,
+  args : [one_version, meson.project_source_root()])
+test('one-version-self-test', python3,
+  args : [one_version, '--self-test'])
