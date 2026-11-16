@@ -36,3 +36,8 @@ test('one-version', python3,
   args : [one_version, meson.project_source_root()])
 test('one-version-self-test', python3,
   args : [one_version, '--self-test'])
+
+# One port form, one name per flag: the removed spellings are refused.
+cli_refusals = files('cli_refusals.py')
+test('cli-refusals', python3,
+  args : [cli_refusals, reac_repacer_exe])

@@ -50,7 +50,7 @@ repace_dep = declare_dependency(link_with : repace_lib, include_directories : re
 
 repacer_deps = [threads_dep, m_dep, libreac_dep, repace_dep]
 
-executable('reac-repacer',
+reac_repacer_exe = executable('reac-repacer',
   'tools/reac_repacer.c',
   dependencies : repacer_deps,
   install : true)
