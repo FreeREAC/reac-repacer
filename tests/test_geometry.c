@@ -23,14 +23,11 @@
  *    test asserts the equality across the whole legal domain so the claim is not
  *    made a third time. The real defect in that expression is (4) below.
  *
- * 3. libreac's reac_upstream_channels() is the same arithmetic done properly,
- *    and reac-repacer still cannot call it: it rejects the 40-channel solution,
- *    which is correct for a box return (1492 B is the downstream broadcast, never
- *    an upstream) and wrong here, because inj_copy_rx reads exactly that
- *    downstream broadcast off the wired OUT port. Pinned so a future "just use
- *    libreac's" simplification fails loudly instead of silently disabling
- *    --inject-copy on every rig. What the repacer does take from libreac is the
- *    trailer rule itself (reac_frame_clean_len) and the geometry constants.
+ * 3. libreac owns the upstream-width claim (its tests/test_upstream.c asserts
+ *    reac_upstream_channels() for every width, 1492 B included, as a 40-wide box
+ *    may fill the fabric). This file does not repeat it: it pins only what
+ *    rp_frame_channels() answers, and that the inject paths accept the 1492 B
+ *    downstream broadcast inj_copy_rx reads off the wired OUT port.
  *
  * 4. Lengths that are not legal REAC audio frames are rejected. The old
  *    expression returned a plausible count for them, and a wrong nch is a wrong
@@ -41,8 +38,6 @@
 #define main repacer_main
 #include "../tools/reac_repacer.c"
 #undef main
-
-#include <reac/reac_upstream.h>
 
 static int fails;
 #define CHK(cond) do { \
@@ -69,11 +64,8 @@ int main(void)
 	CHK(rp_frame_channels(1204) == 32 && rp_frame_channels(1206) == 32);  /* S-4000  */
 	CHK(rp_frame_channels(1492) == 40 && rp_frame_channels(1494) == 40);  /* master downstream */
 
-	/* 3: why libreac's upstream oracle is not the one called here */
-	CHK(reac_upstream_channels(1204) == 32);   /* a clean upstream width it knows */
-	CHK(reac_upstream_channels(1492) == -1);   /* ...but 40 ch is not an upstream */
-	CHK(reac_upstream_channels(1494) == -1);
-	CHK(rp_frame_channels(1492) == 40);           /* and the inject paths must accept it */
+	/* 3: the inject paths must accept the 1492 B downstream broadcast */
+	CHK(rp_frame_channels(1492) == 40);
 
 	/* 4: malformed lengths decline instead of producing a stride */
 	CHK(rp_frame_channels(160) == -1);            /* 52 + 3*36: odd width, braid needs pairs */
