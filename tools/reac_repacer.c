@@ -32,7 +32,6 @@
 //          [--no-auto-rate] [--period-ns N] [--cpu 3] [--prio 80]
 //          [--bcast-only] [--no-plc] [--ctrl-bypass] [--forward-only]
 //          [--no-steady] [--no-warm-start] [--lockfile PATH]
-//        (single port also accepts the legacy  --in IFACE --out IFACE  form.)
 //        --help/-h prints the full usage and exits. At least one --port is
 //        required: there is no implicit default, an unknown flag is rejected, and
 //        a missing port is an error (the daemon never launches with defaults).
@@ -1126,12 +1125,9 @@ int main(int argc, char **argv) {
 	for (int i = 1; i < argc; i++)
 		if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
 
-	const char *pend_in = NULL, *pend_out = NULL;
 	int prefill_ms = 12, cpu = 3, prio = 80; long period_ns = 250000;
 	for (int i = 1; i < argc; i++) {
-		if (!strcmp(argv[i], "--in") && i + 1 < argc) pend_in = argv[++i];
-		else if (!strcmp(argv[i], "--out") && i + 1 < argc) pend_out = argv[++i];
-		else if (!strcmp(argv[i], "--port") && i + 1 < argc) {
+		if (!strcmp(argv[i], "--port") && i + 1 < argc) {
 			char *spec = argv[++i], *colon = strchr(spec, ':');
 			if (!colon) { fprintf(stderr, "--port needs IN:OUT, got '%s'\n", spec); return 2; }
 			*colon = '\0';
@@ -1170,7 +1166,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(argv[i], "--warm-start")) g_warm_start = 1;
 		else if (!strcmp(argv[i], "--no-warm-start")) g_warm_start = 0;
 		else if (!strcmp(argv[i], "--lockfile") && i + 1 < argc) g_lockfile = argv[++i];
-		else if (!strcmp(argv[i], "--forward-only") || !strcmp(argv[i], "--no-return")) g_forward_only = 1;
+		else if (!strcmp(argv[i], "--forward-only")) g_forward_only = 1;
 		else if (!strcmp(argv[i], "--help") || !strcmp(argv[i], "-h")) { usage(stdout); return 0; }
 		else if (!strcmp(argv[i], "--clock-margin-ms")) {
 			/* Named rejection for a spelling this usage() advertised but never parsed. The margin
@@ -1192,7 +1188,6 @@ int main(int argc, char **argv) {
 			return 1;
 		}
 	}
-	if (pend_in && pend_out) add_stream(pend_in, pend_out);   /* legacy single-port form */
 	/* No implicit default: launching with no port (bare, or only non-port flags) was a
 	 * footgun -- it silently started a pacer on reactap.11:lan1. Require an explicit port. */
 	if (n_streams == 0) {
