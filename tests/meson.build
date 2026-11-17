@@ -16,6 +16,12 @@ test_geometry = executable('test-geometry',
   install : false)
 test('frame-geometry', test_geometry)
 
+test_retarget = executable('test-retarget',
+  'test_retarget.c',
+  dependencies : repacer_deps,
+  install : false)
+test('hot-retarget', test_retarget)
+
 test_conf = executable('test-conf',
   'test_conf.c',
   dependencies : repace_dep,
