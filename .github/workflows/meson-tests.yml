@@ -1,0 +1,34 @@
+name: meson-tests
+
+# The unit tests of tests/ (inject, frame geometry, config readers, and the README and version checks), which no
+# other workflow ran: fuzz.yml builds only fuzz/. Every push to main and every pull request. libreac is fetched by
+# subprojects/libreac.wrap at its main, so a libreac change that breaks a claim made here is a red run here.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  meson-test:
+    name: meson test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    container:
+      image: fedora:44
+    steps:
+      - name: Install the build dependencies
+        run: |
+          dnf install -y --setopt=install_weak_deps=False --setopt=retries=10 git gcc meson ninja-build python3
+
+      - uses: actions/checkout@v4
+
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          meson setup build
+          meson compile -C build
+          meson test -C build --print-errorlogs
