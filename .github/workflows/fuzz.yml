@@ -22,7 +22,7 @@ jobs:
     # a backstop: fuzz-run spends 60 s on each harness and fuzz-sabotage runs seeds only, so the job ends well inside it
     timeout-minutes: 30
     container:
-      image: fedora:44
+      image: fedora:45
     steps:
       - name: Install clang, libFuzzer, llvm-cov and the static libc
         run: |

@@ -18,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     container:
-      image: fedora:44
+      image: fedora:45
     steps:
       - name: Install the build dependencies
         run: |
