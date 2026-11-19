@@ -5,6 +5,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: No Fedora 44 reference in the workflows
+        run: |
+          tools/test/workflow-fedora-check.sh --self-test
+          tools/test/workflow-fedora-check.sh .
       - name: No site / venue / client / rig-IP leaks
         run: |
           if grep -rInE 'tecman|superpantalles|futini|metropol|\bnau\b|192\.168\.3\.' . \
