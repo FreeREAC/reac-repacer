@@ -32,3 +32,10 @@ jobs:
           meson setup build
           meson compile -C build
           meson test -C build --print-errorlogs
+
+  pr-fixes-issue:
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    uses: Open-Mixer/.github/.github/workflows/pr-fixes-issue.yml@openmixer-v1
